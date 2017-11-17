@@ -26,6 +26,7 @@
 #include <soc/qcom/subsystem_notif.h>
 #include <soc/qcom/subsystem_restart.h>
 #include <soc/qcom/ramdump.h>
+#include <soc/qcom/scm.h>
 
 #include <soc/qcom/smem.h>
 
@@ -1133,11 +1134,13 @@ static __init int modem_restart_late_init(void)
 	void *handle;
 	struct restart_notifier_block *nb;
 
-	smem_ramdump_dev = create_ramdump_device("smem", NULL);
-	if (IS_ERR_OR_NULL(smem_ramdump_dev)) {
-		LOG_ERR("%s: Unable to create smem ramdump device.\n",
-			__func__);
-		smem_ramdump_dev = NULL;
+	if (scm_is_secure_device()) {
+		smem_ramdump_dev = create_ramdump_device("smem", NULL);
+		if (IS_ERR_OR_NULL(smem_ramdump_dev)) {
+			LOG_ERR("%s: Unable to create smem ramdump device.\n",
+				__func__);
+			smem_ramdump_dev = NULL;
+		}
 	}
 
 	for (i = 0; i < ARRAY_SIZE(restart_notifiers); i++) {
