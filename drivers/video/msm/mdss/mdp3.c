@@ -1844,7 +1844,8 @@ int mdp3_put_img(struct mdp3_img_data *data, int client)
 	struct ion_client *iclient = mdp3_res->ion_client;
 	int dom = mdp3_get_domain(data->flags);
 	int dir = DMA_BIDIRECTIONAL;
-
+	//pr_err("client:%d, data->len:%lu \n",client,data->len);
+	
 	if (data->flags & MDP_MEMORY_ID_TYPE_FB) {
 		pr_info("mdp3_put_img fb mem buf=0x%pa\n", &data->addr);
 		fdput(data->srcp_f);
@@ -1894,7 +1895,7 @@ int mdp3_map_layer(struct mdp3_img_data *data, int client)
 {
 	int ret = 0;
 	int dom = mdp3_get_domain(data->flags);
-
+//pr_err("client:%d, data->len:%lu \n",client,data->len);
 	if (client == MDP3_CLIENT_PPP || client == MDP3_CLIENT_DMA_P) {
 		ret = mdss_smmu_map_dma_buf(data->srcp_dma_buf,
 			data->tab_clone, dom,
@@ -1953,7 +1954,7 @@ int mdp3_get_img(struct msmfb_data *img, struct mdp3_img_data *data, int client)
 
 	data->flags |= img->flags;
 	data->offset = img->offset;
-
+//pr_err("client:%d, data->len:%lu \n",client,data->len);
 	if (img->flags & MDP_MEMORY_ID_TYPE_FB) {
 		f = fdget(img->memory_id);
 		if (f.file == NULL) {
