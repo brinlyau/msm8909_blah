@@ -17,4 +17,7 @@ int mdss_spi_tx_command(const void *buf);
 int mdss_spi_tx_parameter(const void *buf, size_t len);
 int mdss_spi_tx_pixel(const void *buf, size_t len);
 int mdss_spi_read_data(u8 reg_addr, u8 *data, u8 len);
+//[4101][Raymond]Display driver porting - begin
+int mdss_spi_read_epd_data(u8 reg_addr, u8 *data, u8 len);
+//[4101][Raymond]Display driver porting - end
 #endif /* End of __MDSS_SPI_CLINET_H__ */

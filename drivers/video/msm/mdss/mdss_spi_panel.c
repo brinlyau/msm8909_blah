@@ -19,14 +19,145 @@
 #include <linux/leds.h>
 #include <linux/qpnp/pwm.h>
 #include <linux/of_device.h>
+#include <linux/types.h>
+#include <linux/unistd.h>
+#include <linux/fcntl.h>
+#include <linux/firmware.h>
+//#include <stdio.h>
+//#include <linux/stdio.h>
+//#include "stdio.h"
 
 #include "mdss.h"
 #include "mdss_panel.h"
 #include "mdss_spi_panel.h"
 #include "mdss_spi_client.h"
 #include "mdp3.h"
+#include <linux/uaccess.h>
+#include <linux/workqueue.h>
+//[4101][Raymond] Implement call back feature - begin
+struct device *g_dev = NULL;
+static int gdev_done=0;
+//[4101][Raymond] Implement call back feature - end
+#define debug_panel 0
+//<2018/10/08,Yuchen-[4101] define value
+#define TOTAL_PIXEL_ARY_CNT 144000
+#define EXT_UPDATE_PIXEL 10
+//[4101][Raymond]revert defalut os_mode is Light os mode - begin
+static int DYN_PARTIAL_UPDATE =1;
+//[4101][Raymond]revert defalut os_mode is Light os mode- end
+//#define DYN_PARTIAL_UPDATE 1
+//>2018/10/08,Yuchen
+#define HOT_FIX_LCM_INI_FAIL 1/* 2018/10/23,Yuchen */
+int frame_drop = 1;
+//[4101][LCM][RaymondLin] Add LCM_vendor file node for PCBA function test begin
+#include <linux/proc_fs.h>
+//[4101][LCM][RaymondLin] Add LCM_vendor file node for PCBA function test end
+//[4101][Raymond]off charging icon - begin
+//2019/02/23,Yuchen #include "black_offcharging.h"
+#include "white_offcharging.h"
+//[4101][Raymond]picture of the battery full for off-charging -begin
+#include "white_full_chg.h"
+//[4101][Raymond]picture of the battery full for off-charging -end
+//[4101][Raymond]off charging icon - end
+
+static bool rcy_mode=false; //2019/03/20,Yuchen-[4101] add recovery mode
+
+static int wf_mode=3;
+static int pu_en=0;
+static int pu_x=0;
+static int pu_y=0;
+static int pu_rx=0;
+static int pu_ry=0;
+static int pu_w=600;
+static int pu_l=480;
+//[4101][Raymond]revert defalut os_mode is Light os mode - begin
+int os_mode=0; // 0:android , 1:light os
+static int bflash=1; // 0:not flash , 1:flash
+//[4101][Raymond]revert defalut os_mode is Light os mode - end
+static int done_flash=1; // 0:Not done flash, 1:Done flash
+//[4101][Raymond]picture of the battery full for off-charging -begin
+static int battery_full=0; //1:full chared , 0:charging
+//[4101][Raymond]picture of the battery full for off-charging -end
+u16 drx_x3=0x00;
+u16 drx_x4=0x00;
+u16 drx_y5=0x00;
+u16 drx_y6=0x00;
+u16 drx_w7=0x02;
+u16 drx_w8=0x58;
+u16 drx_l9=0x01;
+u16 drx_l10=0xE0;
+u16 vcom_value=0x31; //default 2.45
+//<2019/02/23,Yuchen- [4101] reduce icon raw data
+char EPD_Macro_Insert_4bit[TOTAL_PIXEL_ARY_CNT+2]={ 0 };//Macro Insert use
+#define Insert_pixel(xor_c,pixel_buf,icon_w,icon_h,h_gap,w_gap)  \
+do{                                                              \
+  int i,j,k;                                                     \
+  j=0;                                                           \
+  for(i=0; i<icon_h; i++){                                       \
+    for(k=0; k<icon_w; k++){                                     \
+      EPD_Macro_Insert_4bit[(300*(i+w_gap))+h_gap+k]=pixel_buf[j] ^ xor_c; \
+      j++;                                                       \
+    }                                                            \
+  }                                                              \
+}while(0)
+//>2019/02/23,Yuchen
+
+#define TSC         0x40
+#define INIT        	0
+#define A2        	1
+#define DU        	2
+#define GL16        3
+#define GC16        4
+#define WF_FILE_NAME "V270_W006_68_TC9905_ED028TC1U2_CTC_20190417.bin"
+const struct firmware *wf_file_cfg = NULL;
+static int first_request=1;
+//[4101][Raymond]off charging icon - begin
+static int chg_mode=0; //0:normal , 1:off charging mode
+static int color_id=1; // 1:black , 2:white
+static int chg_mode_show=1;
+static int show_count=0;
+static int EPD_POF=0;
+//[4101][Raymond]off charging icon - end
+//[4101][Raymond]three seconds Power Off command Implementation - begin
+static struct delayed_work epd_pof_work;
+//[4101][Raymond]three seconds Power Off command Implementation - end
+
+//[4101][Raymond] Implement call back feature - begin	
+	char *envp[2] = {"EPD_BUSY=0", NULL};
+//[4101][Raymond] Implement call back feature - end
+//[4101][Raymond] impelment uevent feature - begin
+	char *envp2[2] = {"EPD_BUSY=1", NULL};
+	char *power0[2] = {"POWER=0", NULL};
+	char *power1[2] = {"POWER=1", NULL};
+//[4101][Raymond] impelment uevent feature - end
+static int panel_suspend=0;
 
 DEFINE_LED_TRIGGER(bl_led_trigger);
+
+static int check_busy_n_status(unsigned int busy_gpio)
+{
+	int rc = 0;
+	#if 0
+	rc = gpio_request(busy_gpio, "disp_busy");
+	if (rc) {
+		pr_err("disp_busy: gpio request failed\n");
+		gpio_free(busy_gpio);
+		return 1;
+	}
+
+	rc = gpio_direction_input(busy_gpio);
+		if (rc < 0) {
+		pr_err("disp_busy: gpio direction_input failed\n");
+		gpio_free(busy_gpio);
+		return 1;
+	}
+	mdelay(10);
+	#endif
+	 rc=gpio_get_value(busy_gpio);
+	//gpio_free(busy_gpio);
+	return rc;
+}
+
 static int mdss_spi_panel_reset(struct mdss_panel_data *pdata, int enable)
 {
 	struct spi_panel_data *ctrl_pdata = NULL;
@@ -47,11 +178,15 @@ static int mdss_spi_panel_reset(struct mdss_panel_data *pdata, int enable)
 		return rc;
 	}
 
+//raymond test remove disp_dc_gpio pin - begin
+#if 0
 	if (!gpio_is_valid(ctrl_pdata->disp_dc_gpio)) {
 		pr_debug("%s:%d, dc line not configured\n",
 			   __func__, __LINE__);
 		return rc;
 	}
+#endif
+//raymond test remove disp_dc_gpio pin - end
 
 	pr_debug("%s: enable = %d\n", __func__, enable);
 	pinfo = &(ctrl_pdata->panel_data.panel_info);
@@ -60,14 +195,19 @@ static int mdss_spi_panel_reset(struct mdss_panel_data *pdata, int enable)
 		rc = gpio_request(ctrl_pdata->rst_gpio, "disp_rst_n");
 		if (rc) {
 			pr_err("display reset gpio request failed\n");
+			gpio_free(ctrl_pdata->rst_gpio);
 			return rc;
 		}
 
+//raymond test remove disp_dc_gpio pin - begin
+#if 0
 		rc = gpio_request(ctrl_pdata->disp_dc_gpio, "disp_dc");
 		if (rc) {
 			pr_err("display dc gpio request failed\n");
 			return rc;
 		}
+#endif
+//raymond test remove disp_dc_gpio pin - end
 
 		if (!pinfo->cont_splash_enabled) {
 			for (i = 0; i < pdata->panel_info.rst_seq_len; ++i) {
@@ -89,8 +229,12 @@ static int mdss_spi_panel_reset(struct mdss_panel_data *pdata, int enable)
 		gpio_direction_output((ctrl_pdata->rst_gpio), 0);
 		gpio_free(ctrl_pdata->rst_gpio);
 
+//raymond test remove disp_dc_gpio pin - begin
+#if 0
 		gpio_direction_output(ctrl_pdata->disp_dc_gpio, 0);
 		gpio_free(ctrl_pdata->disp_dc_gpio);
+#endif
+//raymond test remove disp_dc_gpio pin - end
 	}
 	return rc;
 }
@@ -154,8 +298,10 @@ static int mdss_spi_panel_pinctrl_init(struct platform_device *pdev)
 static int mdss_spi_panel_power_on(struct mdss_panel_data *pdata)
 {
 	int ret = 0;
+	int rc=0;
 	struct spi_panel_data *ctrl_pdata = NULL;
 
+	pr_err("%s ++\n",__func__);
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
 		return -EINVAL;
@@ -170,7 +316,34 @@ static int mdss_spi_panel_power_on(struct mdss_panel_data *pdata)
 		pr_err("%s: failed to enable vregs for %s\n",
 			__func__, "PANEL_PM");
 	}
+//raymond test remove disp_dc_gpio pin - begin
+//[4101][Raymond] decrease power consumption in suspend - begin
+	if (!gpio_is_valid(ctrl_pdata->vcc_en_gpio)) {
+		pr_err("%s:%d, dc line not configured\n",
+			   __func__, __LINE__);
+		return rc;
+	}
 
+	gpio_direction_output((ctrl_pdata->vcc_en_gpio),1);
+pr_err("%s:%d, pull high vcc en gpio_65 \n",__func__, __LINE__);
+
+	if (!gpio_is_valid(ctrl_pdata->boost_en_gpio)) {
+		pr_err("%s:%d, SHE...!\n",__func__, __LINE__);
+		return rc;
+	}
+	gpio_direction_output((ctrl_pdata->boost_en_gpio),1);
+pr_err("%s:%d, pull high boost_pwr gpio_76 \n",__func__, __LINE__);
+	if (!gpio_is_valid(ctrl_pdata->ls_en_gpio)) {
+		pr_err("%s:%d, SHE...!\n",__func__, __LINE__);
+		return rc;
+	}
+//mdelay(100);
+	gpio_direction_output((ctrl_pdata->ls_en_gpio),1);
+pr_err("%s:%d, pull high level_shift_en gpio_99 \n",__func__, __LINE__);
+       //mdelay(2000);
+
+//[4101][Raymond] decrease power consumption in suspend - end
+//raymond test remove disp_dc_gpio pin - end
 	/*
 	 * If continuous splash screen feature is enabled, then we need to
 	 * request all the GPIOs that have already been configured in the
@@ -181,11 +354,13 @@ static int mdss_spi_panel_power_on(struct mdss_panel_data *pdata)
 		if (mdss_spi_panel_pinctrl_set_state(ctrl_pdata, true))
 			pr_debug("reset enable: pinctrl not enabled\n");
 
+		//[Jialong] no set mdelay(10), because MDSS_EVENT_LINK_READY had set reset pin high 
 		ret = mdss_spi_panel_reset(pdata, 1);
 		if (ret)
 			pr_err("%s: Panel reset failed. rc=%d\n",
 					__func__, ret);
 	}
+	pr_err("%s --\n",__func__);
 
 	return ret;
 }
@@ -194,7 +369,9 @@ static int mdss_spi_panel_power_on(struct mdss_panel_data *pdata)
 static int mdss_spi_panel_power_off(struct mdss_panel_data *pdata)
 {
 	int ret = 0;
+	int rc=0;
 	struct spi_panel_data *ctrl_pdata = NULL;
+	pr_err("%s ++\n",__func__);
 
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
@@ -204,7 +381,10 @@ static int mdss_spi_panel_power_off(struct mdss_panel_data *pdata)
 	ctrl_pdata = container_of(pdata, struct spi_panel_data,
 				panel_data);
 
+	//[4101][Jialong]Add delay 10ms after reset pin set low 20190812 Start
 	ret = mdss_spi_panel_reset(pdata, 0);
+	mdelay(10);
+	//[4101][Jialong]Add delay 10ms after reset pin set low 20190812 End
 	if (ret) {
 		pr_warn("%s: Panel reset failed. rc=%d\n", __func__, ret);
 		ret = 0;
@@ -220,7 +400,38 @@ static int mdss_spi_panel_power_off(struct mdss_panel_data *pdata)
 		pr_err("%s: failed to disable vregs for %s\n",
 			__func__, "PANEL_PM");
 
+	//raymond test remove disp_dc_gpio pin - begin
+//[4101][Raymond] decrease power consumption in suspend - begin
+#if 1
+//[4101][Jialong]modify power off sequence, VDD turn off at last 20190812 Start
+	if (!gpio_is_valid(ctrl_pdata->boost_en_gpio)) {
+		pr_err("%s:%d, SHE...!\n",__func__, __LINE__);
+		return rc;
+	}
+	gpio_direction_output((ctrl_pdata->boost_en_gpio),0);
+
+	if (!gpio_is_valid(ctrl_pdata->ls_en_gpio)) {
+		pr_err("%s:%d, SHE...!\n",__func__, __LINE__);
+		return rc;
+	}
+	gpio_direction_output((ctrl_pdata->ls_en_gpio),0);
+
+	if (!gpio_is_valid(ctrl_pdata->vcc_en_gpio)) {
+		pr_err("%s:%d, dc line not configured\n",
+			   __func__, __LINE__);
+		return rc;
+	}
+
+	gpio_direction_output((ctrl_pdata->vcc_en_gpio),0);
+
+    //[4101][Jialong]modify power off sequence, VDD turn off at last 20190812 End
+
+#endif
+//[4101][Raymond] decrease power consumption in suspend - end
+//raymond test remove disp_dc_gpio pin - end
+
 end:
+	pr_err("%s --\n",__func__);
 	return ret;
 }
 
@@ -339,7 +550,10 @@ static int mdss_spi_panel_event_handler(struct mdss_panel_data *pdata,
 			return rc;
 		}
 		mdss_spi_panel_pinctrl_set_state(ctrl_pdata, true);
+		//[4101][Jialong]Add delay 10ms after reset pin set high 20190812 Start
+		mdelay(10);
 		mdss_spi_panel_reset(pdata, 1);
+		//[4101][Jialong]Add delay 10ms after reset pin set high 20190812 End
 		break;
 	case MDSS_EVENT_UNBLANK:
 		rc = mdss_spi_panel_unblank(pdata);
@@ -370,6 +584,7 @@ int is_spi_panel_continuous_splash_on(struct mdss_panel_data *pdata)
 	struct dss_vreg *vreg;
 	int num_vreg;
 	struct spi_panel_data *ctrl_pdata = NULL;
+	pr_err("%s ++\n",__func__);
 
 	ctrl_pdata = container_of(pdata, struct spi_panel_data,
 			panel_data);
@@ -384,7 +599,7 @@ int is_spi_panel_continuous_splash_on(struct mdss_panel_data *pdata)
 			 voltage <= vreg[i].max_voltage))
 			return false;
 	}
-
+	pr_err("%s --\n",__func__);
 	return true;
 }
 
@@ -392,7 +607,7 @@ static void enable_spi_panel_te_irq(struct spi_panel_data *ctrl_pdata,
 							bool enable)
 {
 	static bool is_enabled = true;
-
+//pr_err("%s ++\n",__func__);
 	if (is_enabled == enable)
 		return;
 
@@ -401,17 +616,83 @@ static void enable_spi_panel_te_irq(struct spi_panel_data *ctrl_pdata,
 			   __func__, __LINE__);
 		return;
 	}
-
+#if 0
 	if (enable)
 		enable_irq(gpio_to_irq(ctrl_pdata->disp_te_gpio));
 	else
 		disable_irq(gpio_to_irq(ctrl_pdata->disp_te_gpio));
-
+#endif
 	is_enabled = enable;
+	//pr_err("%s --\n",__func__);
 }
 
+//char EPD_fb[36002]={ 0 };
+//char EPD_fb_2bit[72002]={ 0 };
+char EPD_fb_4bit[TOTAL_PIXEL_ARY_CNT+2]={ 0 };//2018/10/08,Yuchen- [4101] 144002 -> TOTAL_PIXEL_ARY_CNT+2
+//<2018/10/08,Yuchen-[4101]partial update
+char EPD_fb_4bit_partial[TOTAL_PIXEL_ARY_CNT+2]={ 0 }; 
+//#if DYN_PARTIAL_UPDATE
+char EPD_fb_4bit_pre[TOTAL_PIXEL_ARY_CNT + 3]={ 0x00 };
+bool has_pre_frame=false;
+//#endif
+
+static bool bRemoteContentInconsistant = true;
+//>2018/10/08,Yuchen
+bool already_probe=false;//2018/10/23,Yuchen
+     //char parm_R11h[]={0x11, 0x00};
+char parm_b5[]={0x12, 0x18, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};
+char parm_dtmw_full[]={0x83, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};
+char parm_dtmw_partial[]={0x83, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};
+char pixel1[1]={ 0 };
+char pixel2[1]={ 0 };
+char PON_REG[]={0x04}; //PON
+char POF_REG[]={02}; //POF
+
+#if 0
+static void epd_disable_irq(struct mdss_panel_data *pdata)
+{
+	struct spi_panel_data *ctrl = NULL;
+	struct spi_panel_data *ctrl_pdata = (struct spi_panel_data *)pdata;
+	unsigned long flags;
+pr_err("%s [Raymond] ++  \n",__func__);
+	ctrl = container_of(pdata, struct spi_panel_data,
+				panel_data);
+	
+	spin_lock_irqsave(&ctrl_pdata->irq_enabled_lock, flags);
+	if (&ctrl_pdata->irq_enabled) {
+		disable_irq_nosync(ctrl_pdata->irq);
+		ctrl->irq_enabled = false;
+	}
+	spin_unlock_irqrestore(&ctrl_pdata->irq_enabled_lock, flags);
+pr_err("%s [Raymond] --  \n",__func__);	
+}
+#endif
+#if 1
+irqreturn_t epd_irq_handler(int irq, void *data)
+{
+	struct spi_panel_data *ctrl_pdata = (struct spi_panel_data *)data;
+	//int rc =0;
+	
+	//pr_err("%s ++  \n",__func__);
+	if (!ctrl_pdata) {
+		pr_err("%s: SPI display not available\n", __func__);
+		return IRQ_HANDLED;
+	}
+	
+	if(ctrl_pdata->irq_enable){
+		//pr_err("%s disable_irq_nosync  \n",__func__);
+		disable_irq_nosync(ctrl_pdata->irq);
+		ctrl_pdata->irq_enable = false;
+		}
+	//rc= gpio_get_value(ctrl_pdata->disp_busy_gpio);
+	wake_up(&ctrl_pdata->busy_wq);
+	//pr_err("%s -- \n",__func__);
+	return IRQ_HANDLED;
+}
+#endif
+
 int mdss_spi_panel_kickoff(struct mdss_panel_data *pdata,
-			char *buf, int len, int dma_stride)
+			char *buf, int len, int dma_stride, bool bDelay)
 {
 	struct spi_panel_data *ctrl_pdata = NULL;
 	char *tx_buf;
@@ -422,72 +703,1112 @@ int mdss_spi_panel_kickoff(struct mdss_panel_data *pdata,
 	int actual_stride = 0;
 	int byte_per_pixel = 0;
 	int scan_count = 0;
+	int i,j;
+	//int busy_n;
+	//bool bNeedUpdate = os_mode?false:true;
+	bool bNeedUpdate = true;
+	int bflash_times=1;
+	//<2018/10/08,Yuchen-[4101]partial update
 
+//#if DYN_PARTIAL_UPDATE
+	char parm_b5_partial[]={0x12, 0x18, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};
+	char temp_coordinate;
+	int x1,x2,y1,y2;
+	int irq_gpio_value=0;
+	int ret;
+
+//#endif
+
+	//>2018/10/08,Yuchen
+
+
+//	static int count = 0;
+//pr_err("[B]%s(%d): len=%d\n", __func__, __LINE__, len);
+//if(frame_drop==5){
+if(bDelay && bflash>=0 && panel_suspend==0){
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
 		return -EINVAL;
 	}
 
+//[4101][Raymond]three seconds Power Off command Implementation - begin
+//pr_err("%s [Raymond] bflash:%d  \n",__func__,bflash);
+cancel_delayed_work_sync(&epd_pof_work);
+//[4101][Raymond]three seconds Power Off command Implementation - end
+if(os_mode==1){
+bflash_times=bflash;
+//bflash=0;
+}
 	ctrl_pdata = container_of(pdata, struct spi_panel_data,
 				panel_data);
 
 	tx_buf = ctrl_pdata->tx_buf;
 	panel_xres = ctrl_pdata->panel_data.panel_info.xres;
 	panel_yres = ctrl_pdata->panel_data.panel_info.yres;
+//pr_err("[B]%s(%d): panel_xres=%d, panel_yres=%d, ctrl_pdata->panel_data.panel_info.bpp=%d\n", __func__, __LINE__, panel_xres, panel_yres, ctrl_pdata->panel_data.panel_info.bpp);
 
+#if 1
+	byte_per_pixel = 4;
+#else
 	byte_per_pixel = ctrl_pdata->panel_data.panel_info.bpp / 8;
+#endif
 	actual_stride = panel_xres * byte_per_pixel;
 	padding_length = dma_stride - actual_stride;
 
+//<2018/10/23,Yuchen-[4101] workaround. lcm initial fail issue.
+#if HOT_FIX_LCM_INI_FAIL
+	if(already_probe){
+		already_probe=false;
+		mutex_lock(&ctrl_pdata->spi_tx_mutex);
+
+		pr_err("========= do power off  =========\n");
+		rc = mdss_spi_panel_power_off(pdata);
+		if (rc) {
+			pr_err("unable to off power. rc:[%d]\n", rc );
+		}
+
+		pr_err("========= power on again =========\n");
+		rc = mdss_spi_panel_power_on(pdata);
+		if (rc) {
+			pr_err(" panel power on fail. rc:[%d]\n", rc );
+		}
+		rc = mdss_spi_panel_pinctrl_set_state(ctrl_pdata, true);
+		if (rc){
+			pr_err(" panel pinctrl fail. rc:[%d]\n", rc );
+		}
+		rc = mdss_spi_panel_reset(pdata, 1);
+		if (rc)
+			pr_err(" Panel reset failed. rc:[%d]\n", rc);
+
+		rc = ctrl_pdata->on(pdata);
+		if (rc) {
+			pr_err(" panel on fail. rc:[%d]\n", rc );
+		}else{
+			ctrl_pdata->ctrl_state |= CTRL_STATE_PANEL_INIT;
+		}
+
+		mutex_unlock(&ctrl_pdata->spi_tx_mutex);
+	}
+#endif
+//>2018/10/23,Yuchen
+
+//pr_err("[B]%s(%d): byte_per_pixel=%d, actual_stride=%d, padding_length=%d\n", __func__, __LINE__, byte_per_pixel, actual_stride, padding_length);
 	/* remove the padding and copy to continuous buffer */
+if(os_mode==0){
 	while (scan_count < panel_yres) {
-		memcpy((tx_buf + scan_count * actual_stride),
-			(buf + scan_count * (actual_stride + padding_length)),
-				actual_stride);
+		if(!bNeedUpdate){
+			char * pX;
+			char * pB;
+			const char * pBound = tx_buf + scan_count * actual_stride + actual_stride;
+			for(pX=tx_buf + scan_count * actual_stride,
+				pB=buf + scan_count * (actual_stride + padding_length)
+				;
+				pX<pBound
+				;
+				pX++,pB++){
+					if((*pX)^(*pB)){
+						bNeedUpdate = true;
+						break;
+					}
+			}
+		}
+		if(bNeedUpdate)break;
 		scan_count++;
 	}
 
-	enable_spi_panel_te_irq(ctrl_pdata, true);
+if(bRemoteContentInconsistant){
+	bRemoteContentInconsistant = false;
+	bNeedUpdate = true;
+}
+}
+//pr_err("[Raymond] bNeedUpdate:%d \n",bNeedUpdate);
+if(bNeedUpdate){
+	if(os_mode){
+		scan_count = 0;
+		while (scan_count < panel_yres) {
+			memcpy((tx_buf + scan_count * actual_stride),
+				(buf + scan_count * (actual_stride + padding_length)),
+					actual_stride);
+
+			scan_count++;
+		}
+	}
+
+
+	//enable_spi_panel_te_irq(ctrl_pdata, true);
 
 	mutex_lock(&ctrl_pdata->spi_tx_mutex);
-	reinit_completion(&ctrl_pdata->spi_panel_te);
+	//reinit_completion(&ctrl_pdata->spi_panel_te);
 
-	rc = wait_for_completion_timeout(&ctrl_pdata->spi_panel_te,
-				   msecs_to_jiffies(SPI_PANEL_TE_TIMEOUT));
+	//rc = wait_for_completion_timeout(&ctrl_pdata->spi_panel_te,
+				   //msecs_to_jiffies(SPI_PANEL_TE_TIMEOUT));
 
-	if (rc == 0)
-		pr_err("wait panel TE time out\n");
+	//if (rc == 0)
+		//pr_err("wait panel TE time out\n");
 
-	rc = mdss_spi_tx_pixel(tx_buf, ctrl_pdata->byte_pre_frame);
+
+if(EPD_POF==1){
+	mdss_spi_tx_parameter(PON_REG,sizeof(PON_REG)); //PON	
+	//raymond implement begin
+		irq_gpio_value =gpio_get_value(ctrl_pdata->disp_busy_gpio);
+		if(irq_gpio_value==0){
+			while(1){
+				ret = 0;
+				
+				if(!ctrl_pdata->irq_enable){
+				ctrl_pdata->irq_enable=true;
+				enable_irq(ctrl_pdata->irq);
+				}
+				
+				if(!gpio_get_value(ctrl_pdata->disp_busy_gpio)){
+					ret = wait_event_interruptible(ctrl_pdata->busy_wq, !ctrl_pdata->irq_enable);
+				}
+
+				if(ctrl_pdata->irq_enable){
+					disable_irq_nosync(ctrl_pdata->irq);
+					ctrl_pdata->irq_enable=false;
+				}
+
+				if(gpio_get_value(ctrl_pdata->disp_busy_gpio))
+				break;
+			}
+		}
+		//raymond implement end
+	EPD_POF=0;
+}
+#if 1
+#if 1 //capture RGB value to 4 bit and swap
+//[4101]Fine tune performance begin
+#if 1
+{
+    char *temp_tx_buf_DataPointW;
+    char *temp_tx_buf_DataPointH1;
+    char *temp_tx_buf_DataPointH2;
+    char *temp_EPD_fb_4bit_DataPointW;
+    char *temp_EPD_fb_4bit_DataPointH;
+    int width = 0;
+    int height = 0;
+    char temp_2Pixels;
+    char temp_Pixel1;
+    char temp_Pixel2;
+    bool temp_width_changed = false;
+
+    j = j + 1;
+    i = i + 1;
+
+    //<2018/10/08,Yuchen-[4101]find region
+    x1 = 600;//start width
+    x2 = 0;//end width
+    y1 = 480;//start height
+    y2 = 0;//end height
+    //>2018/10/08,Yuchen
+
+    EPD_fb_4bit[0] = 0x10;
+    EPD_fb_4bit[1] = 0x03;
+    temp_tx_buf_DataPointW = tx_buf;
+    temp_EPD_fb_4bit_DataPointW = &EPD_fb_4bit[143999 + 2];
+    for(width = 598; width >= 0; width -= 2) // process 2 pixles in 1 loop
+    {
+      temp_tx_buf_DataPointH1 = temp_tx_buf_DataPointW;
+      temp_tx_buf_DataPointH2 = temp_tx_buf_DataPointW + 1920;
+      temp_EPD_fb_4bit_DataPointH = temp_EPD_fb_4bit_DataPointW;
+      for(height = 479; height >= 0; height--)
+      {
+        // 2 pixels of each line
+        temp_Pixel1 = ((temp_tx_buf_DataPointH1[0] * 300) + (temp_tx_buf_DataPointH1[1] * 600) + (temp_tx_buf_DataPointH1[2] * 124)) >> 10;
+        temp_Pixel2 = ((temp_tx_buf_DataPointH2[0] * 300) + (temp_tx_buf_DataPointH2[1] * 600) + (temp_tx_buf_DataPointH2[2] * 124)) >> 10;
+        //temp_Pixel1 = ((*(temp_tx_buf_DataPointH1) << 8) + (*(temp_tx_buf_DataPointH1 + 1) << 9) + (*(temp_tx_buf_DataPointH1 + 2) << 7)) >> 10;
+        //temp_Pixel2 = ((*(temp_tx_buf_DataPointH2) << 8) + (*(temp_tx_buf_DataPointH2 + 1) << 9) + (*(temp_tx_buf_DataPointH2 + 2) << 7)) >> 10;
+
+        // combine 2 pixels into 1 byte
+        temp_2Pixels = (temp_Pixel2 & 0xF0) | ((temp_Pixel1 & 0xF0) >> 4);
+
+        // check dirty update
+        if(DYN_PARTIAL_UPDATE == 1)
+        {
+          if(temp_EPD_fb_4bit_DataPointH[0] != temp_2Pixels)
+          {
+            temp_EPD_fb_4bit_DataPointH[0] = temp_2Pixels;
+            temp_width_changed = true;
+            //--update region---
+            if( height < y1) y1 = height;
+            if( height > y2) y2 = height;
+          }
+        }
+	else{
+		if(temp_EPD_fb_4bit_DataPointH[0] != temp_2Pixels)
+           	 temp_EPD_fb_4bit_DataPointH[0] = temp_2Pixels;
+		}
+        temp_tx_buf_DataPointH1 += 4;
+        temp_tx_buf_DataPointH2 += 4;
+        temp_EPD_fb_4bit_DataPointH -= 300;
+      }
+      if(temp_width_changed)
+      {
+        if( width < x1) x1 = width; //find smallest point
+        if( width > x2) x2 = width; //find largest point
+        temp_width_changed = false;
+      }
+      temp_tx_buf_DataPointW += 3840;//1920;
+      temp_EPD_fb_4bit_DataPointW--;
+    }
+	if(os_mode==0){	
+		mdss_spi_tx_parameter(EPD_fb_4bit, TOTAL_PIXEL_ARY_CNT + 2); //2018/10/08,Yuchen- [4101] 144002 -> TOTAL_PIXEL_ARY_CNT+2
+	}
+  }
+#else
+//[4101]Fine tune performance end
+
+	{
+		int k=0;
+		int p=0;
+		j=1;
+		//<2018/10/08,Yuchen-[4101]find region
+
+          //#if DYN_PARTIAL_UPDATE
+		x1 = 600;//start width
+		x2 = 0;//end width
+		y1 = 480;//start height
+		y2 = 0;//end height
+          //#endif
+
+		//>2018/10/08,Yuchen
+		EPD_fb_4bit[0] = 0x10;
+		EPD_fb_4bit[1] = 0x03;
+		for(i=143999;i>=143700;i--){
+			for(k=0;k<480;k++){
+				pixel1[0]= ( (tx_buf[j+p-1]*300)+(tx_buf[j+p]*600)+(tx_buf[j+p+1]*124) )>>10 ;
+				pixel2[0]= ( (tx_buf[j+p+1919]*300)+(tx_buf[j+p+1920]*600)+(tx_buf[j+p+1921]*124) )>>10 ;
+				EPD_fb_4bit[i-(k*300)+2] =((pixel2[0]&0xF0)>>0) |  ((pixel1[0]&0xF0)>>4);
+				//EPD_fb_4bit[i*300+k+2] =((pixel1[0]&0xF0)>>4) |  ((pixel2[0]&0xF0)>>0);
+				//EPD_fb_4bit[i*300+k+2] = ((( (tx_buf[j-1]*300)+(tx_buf[j]*600)+(tx_buf[j+1]*124)>>10)>>4) >>4)  | ((( (tx_buf[j+3]*300)+(tx_buf[j+4]*600)+(tx_buf[j+5]*124)>>10)>>4) >>0) ;
+				//EPD_fb_4bit[i*300+k+2] =((tx_buf[j]&0xF0)>>4) |  ((tx_buf[j+4]&0xF0)>>0);
+                           //pr_err("[%s][%d]\n",__func__,(i-(k*300)+2));
+				//<2018/10/08,Yuchen-[4101]count pixel and find region
+			if(DYN_PARTIAL_UPDATE==1){
+                          //#if DYN_PARTIAL_UPDATE
+				if(has_pre_frame){
+					if(EPD_fb_4bit[i-(k*300)+2]!=EPD_fb_4bit_pre[i-(k*300)+2]){
+			//--update region---
+			if( (i-143700)*2 < x1)x1=(i-143700)*2;//find smallest point
+			if( (i-143700)*2 > x2)x2=(i-143700)*2;//find largest point
+			if( (479-k) < y1)y1=(479-k);
+			if( (479-k) > y2)y2=(479-k);
+					}
+				}
+                          //#endif
+				}
+				//>2018/10/08,Yuchen
+				j=j+4;
+			}
+			p=p+1920;
+		}
+		//<2018/10/08,Yuchen-[4101]drop frame. all white / all black / the same picture
+	if(DYN_PARTIAL_UPDATE==1){
+          //#if DYN_PARTIAL_UPDATE
+		if(!has_pre_frame){
+			has_pre_frame=true;
+		}
+		memcpy(EPD_fb_4bit_pre,EPD_fb_4bit,sizeof(EPD_fb_4bit));
+          //#endif
+		}
+		//>2018/10/08,Yuchen
+		mdss_spi_tx_parameter(EPD_fb_4bit,TOTAL_PIXEL_ARY_CNT+2);//2018/10/08,Yuchen- [4101] 144002 -> TOTAL_PIXEL_ARY_CNT+2
+	}
+#endif
+#else //capture RGB value to 4 bit
+	{
+		j=1;
+		EPD_fb_4bit[0] = 0x10;
+		EPD_fb_4bit[1] = 0x03;
+		for(i=0;i<TOTAL_PIXEL_ARY_CNT;i++){//2018/10/08,Yuchen- [4101] 144000 -> TOTAL_PIXEL_ARY_CNT
+			pixel1[0]= ( (tx_buf[j-1]*300)+(tx_buf[j]*600)+(tx_buf[j+1]*124) )>>10 ;
+			pixel2[0]= ( (tx_buf[j+3]*300)+(tx_buf[j+4]*600)+(tx_buf[j+5]*124) )>>10 ;
+			EPD_fb_4bit[i+2] =((pixel1[0]&0xF0)>>0) |  ((pixel2[0]&0xF0)>>4);
+		//	EPD_fb[i+2] =(!!(tx_buf[j]&0xF0)<<0) |  (!!(tx_buf[j+4]&0xF0)<<1)  |  (!!(tx_buf[j+8]&0xF0)<<2) |  (!!(tx_buf[j+12]&0xF0)<<3) | (!!(tx_buf[j+16]&0xF0)<<4)  |  (!!(tx_buf[j+20]&0xF0)<<5) |  (!!(tx_buf[j+24]&0xF0)<<6) |  (!!(tx_buf[j+28]&0xF0)<<7);
+			j=j+8;
+		}
+		mdss_spi_tx_parameter(EPD_fb_4bit,TOTAL_PIXEL_ARY_CNT+2);//2018/10/08,Yuchen- [4101] 144002 -> TOTAL_PIXEL_ARY_CNT+2
+	}
+
+#endif
+#endif
+
+  //<2018/10/08,Yuchen-[4101]partial update
+  if(DYN_PARTIAL_UPDATE==1){
+  //#if DYN_PARTIAL_UPDATE
+	x1 = (x1-EXT_UPDATE_PIXEL)<0   ? 0   : (x1-EXT_UPDATE_PIXEL);
+	x2 = (x2+EXT_UPDATE_PIXEL)>600 ? 600 : (x2+EXT_UPDATE_PIXEL);
+	y1 = (y1-EXT_UPDATE_PIXEL)<0   ? 0   : (y1-EXT_UPDATE_PIXEL);
+	y2 = (y2+EXT_UPDATE_PIXEL)>480 ? 480 : (y2+EXT_UPDATE_PIXEL);
+
+	if( (x1 < x2) && (y1 < y2) ){
+
+		temp_coordinate = (x1 & 0xffff)>>8;
+		parm_b5_partial[2]=temp_coordinate;
+		temp_coordinate = (x1 & 0xff);
+		parm_b5_partial[3]=temp_coordinate;//set X
+
+		temp_coordinate = (y1 & 0xffff)>>8;
+		parm_b5_partial[4]=temp_coordinate;
+		temp_coordinate = (y1 & 0xff);
+		parm_b5_partial[5]=temp_coordinate;//set Y
+
+		temp_coordinate = ((x2-x1+2) & 0xffff)>>8;
+		parm_b5_partial[6]=temp_coordinate;
+		temp_coordinate = ((x2-x1+2) & 0xff);
+		parm_b5_partial[7]=temp_coordinate;//set W
+
+		temp_coordinate = ((y2-y1+1) & 0xffff)>>8;
+		parm_b5_partial[8]=temp_coordinate;
+		temp_coordinate = ((y2-y1+1) & 0xff);
+		parm_b5_partial[9]=temp_coordinate;//set L
+
+		#if debug_panel
+		  pr_err("[YC] X[0x%x 0x%x]- Y[0x%x 0x%x]\n", parm_b5_partial[2], parm_b5_partial[3], parm_b5_partial[4], parm_b5_partial[5]);
+		  pr_err("[YC] W[0x%x 0x%x]- L[0x%x 0x%x]\n", parm_b5_partial[6], parm_b5_partial[7], parm_b5_partial[8], parm_b5_partial[9]);
+		#endif
+		mdss_spi_tx_parameter(parm_b5_partial,sizeof(parm_b5_partial));
+
+	}else{
+		mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5));
+		//pr_err("[Raymond] Send DRF done \n");
+	}
+  	}
+  else{
+  //#else
+  //[4101][Raymond] impelment uevent feature - begin
+  #if 0
+	if(os_mode==1 && gdev_done==1){
+		kobject_uevent_env(&g_dev->kobj,
+			KOBJ_CHANGE, envp2); // send uevent busy=1
+		pr_err("%s[Raymond] send epd busy=1 uevent \n",__func__);
+	}
+   #endif	
+//[4101][Raymond] impelment uevent feature - end	
+        //mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5)); //raymond test
+  //#endif
+  	}
+  //>2018/10/08,Yuchen
+
+	//rc = mdss_spi_tx_pixel(tx_buf, ctrl_pdata->byte_pre_frame);
+//2018/10/08,Yuchen mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5));
+//rc = mdss_spi_tx_pixel(EPD_fb, 36002);
+//mdss_spi_tx_parameter(parm25,sizeof(parm25));
 	mutex_unlock(&ctrl_pdata->spi_tx_mutex);
+#if 1
+if(os_mode==0){
+	
+//raymond implement begin
+		//pr_err("%s check busy pin - begin \n",__func__);
+		irq_gpio_value =gpio_get_value(ctrl_pdata->disp_busy_gpio);
+		if(irq_gpio_value==0){
+			while(1){
+				ret = 0;
+				
+				if(!ctrl_pdata->irq_enable){
+				ctrl_pdata->irq_enable=true;
+				enable_irq(ctrl_pdata->irq);
+				}
+				
+				if(!gpio_get_value(ctrl_pdata->disp_busy_gpio)){
+					ret = wait_event_interruptible(ctrl_pdata->busy_wq, !ctrl_pdata->irq_enable);
+				}
+
+				if(ctrl_pdata->irq_enable){
+					disable_irq_nosync(ctrl_pdata->irq);
+					ctrl_pdata->irq_enable=false;
+				}
+
+				if(gpio_get_value(ctrl_pdata->disp_busy_gpio))
+				break;
+			}
+		}
+		//raymond implement end
+
+}
+#endif
+done_flash=1;
+}
+
+//pr_err("%s --,done_flash=1 \n",__func__);
+	return rc;
+}
+else{  //drop
+
+return rc;
+}
+}
+
+//[4101][Raymond]Implement EPD update - begin
+int update_epd(struct mdss_panel_data *pdata,int flash_time)
+{
+	//int busy_n;
+	int i;
+	int rc=0;
+	struct spi_panel_data *ctrl = NULL;
+	struct mdss_panel_info *pinfo;
+	int irq_gpio_value=0;
+	int ret;
+	int j,k;
+
+
+	//pr_err("%s ++,flash_time:%d \n",__func__,flash_time);
+	//pr_err("%s [Raymond] bflash:%d  \n",__func__,bflash);
+	cancel_delayed_work_sync(&epd_pof_work);
+	//[4101][Raymond]three seconds Power Off command Implementation - end
+
+	pinfo = &pdata->panel_info;
+	ctrl = container_of(pdata, struct spi_panel_data,
+				panel_data);
+	//pr_err("%s ++ 1,flash_time:%d \n",__func__,flash_time);
+   	EPD_fb_4bit[0] = 0x10;
+   	EPD_fb_4bit[1] = 0x03;
+	EPD_fb_4bit_partial[0]=0x10;
+	EPD_fb_4bit_partial[1]=0x03;
+
+   	kobject_uevent_env(&g_dev->kobj,
+			KOBJ_CHANGE, envp2); // send uevent busy=1
+	pr_err("%s send epd busy=1 uevent \n",__func__);
+
+	
+	if(EPD_POF==1){
+	mdss_spi_tx_parameter(PON_REG,sizeof(PON_REG)); //PON
+	//raymond implement begin
+		//pr_err("%s check busy pin - begin \n",__func__);
+		irq_gpio_value =gpio_get_value(ctrl->disp_busy_gpio);
+		if(irq_gpio_value==0){
+			while(1){
+				ret = 0;
+				
+				if(!ctrl->irq_enable){
+				ctrl->irq_enable=true;
+				enable_irq(ctrl->irq);
+				}
+				
+				if(!gpio_get_value(ctrl->disp_busy_gpio)){
+					ret = wait_event_interruptible(ctrl->busy_wq, !ctrl->irq_enable);
+				}
+
+				if(ctrl->irq_enable){
+					disable_irq_nosync(ctrl->irq);
+					ctrl->irq_enable=false;
+				}
+
+				if(gpio_get_value(ctrl->disp_busy_gpio))
+				break;
+			}
+		}
+		//pr_err("%s check busy pin - end \n",__func__);
+		//raymond implement end
+	EPD_POF=0;
+	}
+	mutex_lock(&ctrl->spi_tx_mutex);
+	//pr_err("%s write pixel to register ++ \n",__func__);
+
+	if(pu_en==0){  //full update
+		//pr_err("%s full write pixel to register \n",__func__);
+		mdss_spi_tx_parameter(parm_dtmw_full,sizeof(parm_dtmw_full)); //DTMW
+   		mdss_spi_tx_parameter(EPD_fb_4bit, TOTAL_PIXEL_ARY_CNT + 2); //write pixel to register
+   		mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5)); //DRF
+		}
+	else{ //partial update
+		//pr_err("%s partial write pixel to register \n",__func__);
+
+		mdss_spi_tx_parameter(parm_dtmw_partial,sizeof(parm_dtmw_partial)); //DTMW
+		for(j=0;j<pu_w;j++){
+			for(k=0;k<(pu_l/2);k++){
+				EPD_fb_4bit_partial[(((j*pu_l)/2)+k)+2] = EPD_fb_4bit[( ((600-(pu_y+pu_l))/2) + (((480-pu_x-pu_w)*600)/2) +k) + (300*j) ];
+			}
+		}
+   		mdss_spi_tx_parameter(EPD_fb_4bit_partial, (((pu_w*pu_l)/2) + 2)); //write pixel to register
+		mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5)); //DRF
+		}
+	//pr_err("%s write pixel to register -- \n",__func__);
+	mutex_unlock(&ctrl->spi_tx_mutex);
+	
+	//raymond implement begin
+	irq_gpio_value =gpio_get_value(ctrl->disp_busy_gpio);
+	if(irq_gpio_value==0){
+		while(1){
+			ret = 0;
+			if(!ctrl->irq_enable){
+				ctrl->irq_enable=true;
+				//pr_err("%s enable_irq \n",__func__);
+				enable_irq(ctrl->irq);
+			}
+			if(!gpio_get_value(ctrl->disp_busy_gpio)){
+				ret = wait_event_interruptible(ctrl->busy_wq, !ctrl->irq_enable);
+			}
+
+			if(ctrl->irq_enable){
+				disable_irq_nosync(ctrl->irq);
+				ctrl->irq_enable=false;
+			}
+
+			if(gpio_get_value(ctrl->disp_busy_gpio))
+				break;
+		}
+	}
+	//raymond implement end
+
+	if(flash_time>1){ //need update twice or more
+		for(i=1; i<flash_time;i++){
+		mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5)); //DRF
+
+		//raymond implement begin
+		irq_gpio_value =gpio_get_value(ctrl->disp_busy_gpio);
+		if(irq_gpio_value==0){
+			while(1){
+				ret = 0;
+				
+				if(!ctrl->irq_enable){
+				ctrl->irq_enable=true;
+				enable_irq(ctrl->irq);
+				}
+				
+				if(!gpio_get_value(ctrl->disp_busy_gpio)){
+					//busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+					ret = wait_event_interruptible(ctrl->busy_wq, !ctrl->irq_enable);
+				}
+
+				if(ctrl->irq_enable){
+					disable_irq_nosync(ctrl->irq);
+					ctrl->irq_enable=false;
+				}
+
+				if(gpio_get_value(ctrl->disp_busy_gpio))
+				break;
+			}
+		}
+		//raymond implement end
+		}
+	}
+
+	bflash=0;
+	schedule_delayed_work(&epd_pof_work,
+			msecs_to_jiffies(3000));
+
+	kobject_uevent_env(&g_dev->kobj,
+		KOBJ_CHANGE, envp); // send uevent busy=0
+	pr_err("%s send epd busy=0 uevent \n",__func__);
+
+	//pr_err("%s --\n",__func__);
+	return rc;
+   
+}
+//[4101][Raymond]Implement EPD update - end
+
+//<2019/03/20,Yuchen-[4101]deal with recovery UI issue
+int mdss_spi_panel_kickoff_recovery(struct mdss_panel_data *pdata,
+			char *buf, int len, int dma_stride, bool bDelay)
+{
+	struct spi_panel_data *ctrl_pdata = NULL;
+	char *tx_buf;
+	int rc = 0;
+	int panel_yres;
+	int panel_xres;
+	int padding_length = 0;
+	int actual_stride = 0;
+	int byte_per_pixel = 0;
+	int scan_count = 0;
+	int busy_n;
+	bool bNeedUpdate = false;
+	char xor_chr;//for different color device
+	//<2018/10/08,Yuchen-[4101]partial update
+	char parm_b5_partial[]={0x12, 0x18, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};
+	char temp_coordinate;
+	int x1,x2,y1,y2;
+	//>2018/10/08,Yuchen
+
+	if(!rcy_mode){//not to handle if not in recovery mode
+		pr_err("%s: [YC] not in recovery mode.\n", __func__);//temp
+		return -EINVAL;
+	}
+
+	if (pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+
+	ctrl_pdata = container_of(pdata, struct spi_panel_data,panel_data);
+	tx_buf = ctrl_pdata->tx_buf;
+	panel_xres = ctrl_pdata->panel_data.panel_info.xres;
+	panel_yres = ctrl_pdata->panel_data.panel_info.yres;
+	byte_per_pixel = 2;//recovery FB- RGB565 only 2 bits
+	actual_stride = panel_xres * byte_per_pixel;
+	padding_length = dma_stride - actual_stride;
+
+	pr_err("[YC]: panel_xres=%d, panel_yres=%d, panel_info.bpp=%d\n",
+               panel_xres, panel_yres, ctrl_pdata->panel_data.panel_info.bpp);
+	pr_err("[YC]: actual_stride=%d, padding_length=%d\n",
+               actual_stride, padding_length);
+	/* drop the same FB */
+	while (scan_count < panel_yres) {
+		if(!bNeedUpdate){
+			char * pX;
+			char * pB;
+			const char * pBound = tx_buf + scan_count * actual_stride + actual_stride;
+			for(pX=tx_buf + scan_count * actual_stride,
+				pB=buf + scan_count * (actual_stride + padding_length)
+				;
+				pX<pBound
+				;
+				pX++,pB++){
+					if((*pX)^(*pB)){
+						bNeedUpdate = true;
+						break;
+					}
+			}
+		}
+		if(bNeedUpdate)break;
+		scan_count++;
+	}
+
+	if(bNeedUpdate){
+		////if update EPD less than 3s then cancel POF timer
+		//cancel_delayed_work_sync(&epd_pof_work);
+
+		//copy new FB pixel
+		scan_count = 0;
+		while (scan_count < panel_yres) {
+			memcpy((tx_buf + scan_count * actual_stride),
+				(buf + scan_count * (actual_stride + padding_length)),
+					actual_stride);
+
+			scan_count++;
+		}
+
+		mutex_lock(&ctrl_pdata->spi_tx_mutex);
+
+		while(1){
+			busy_n=check_busy_n_status(ctrl_pdata->disp_busy_gpio);
+			if(busy_n==1) break;
+		}
+		//if(EPD_POF==1){//previous did not do POF so here no need PON
+			mdss_spi_tx_parameter(PON_REG,sizeof(PON_REG)); //PON
+			msleep(80);
+			while(1){
+				busy_n=check_busy_n_status(ctrl_pdata->disp_busy_gpio);
+				if(busy_n==1) break;
+			}
+			//EPD_POF=0;
+		//}
+
+		//[4101]Fine tune performance begin
+		{
+			char *temp_tx_buf_DataPointW;
+			char *temp_tx_buf_DataPointH1;
+			char *temp_tx_buf_DataPointH2;
+			char *temp_EPD_fb_4bit_DataPointW;
+			char *temp_EPD_fb_4bit_DataPointH;
+			int width = 0;
+			int height = 0;
+			char temp_2Pixels;
+			char temp_Pixel1;
+			char temp_Pixel2;
+			bool temp_width_changed = false;
+
+			//<2018/10/08,Yuchen-[4101]find region
+			x1 = 600;//start width
+			x2 = 0;//end width
+			y1 = 480;//start height
+			y2 = 0;//end height
+			//>2018/10/08,Yuchen
+
+			if(color_id==2){ //white phone
+				xor_chr=0xFF;//inverse
+			}else{
+				xor_chr=0x00;
+			}
+
+			EPD_fb_4bit[0] = 0x10;
+			EPD_fb_4bit[1] = 0x03;
+			temp_tx_buf_DataPointW = tx_buf;
+			temp_EPD_fb_4bit_DataPointW = &EPD_fb_4bit[143999 + 2];
+			for(width = 598; width >= 0; width -= 2){ // process 2 pixles in 1 loop
+				temp_tx_buf_DataPointH1 = temp_tx_buf_DataPointW;
+				temp_tx_buf_DataPointH2 = temp_tx_buf_DataPointW + actual_stride;//yuchen (1920 -> actual_stride)
+				temp_EPD_fb_4bit_DataPointH = temp_EPD_fb_4bit_DataPointW;
+				for(height = 479; height >= 0; height--){
+					// 2 pixels of each line
+					//RGB565
+					temp_Pixel1 = ((temp_tx_buf_DataPointH1[0] & 0xF0));//catch red 4bit only
+					temp_Pixel2 = ((temp_tx_buf_DataPointH2[0] & 0xF0));//catch red 4bit only
+					temp_2Pixels = ( temp_Pixel2 | (temp_Pixel1 >> 4)) ^ xor_chr;//try inverse
+					// check dirty update
+					if(temp_EPD_fb_4bit_DataPointH[0] != temp_2Pixels){
+						temp_EPD_fb_4bit_DataPointH[0] = temp_2Pixels;
+						temp_width_changed = true;
+						//--update region---
+						if( height < y1) y1 = height;
+						if( height > y2) y2 = height;
+					}
+					temp_tx_buf_DataPointH1 += byte_per_pixel;//yuchen (4 -> byte_per_pixel)
+					temp_tx_buf_DataPointH2 += byte_per_pixel;//yuchen (4 -> byte_per_pixel)
+					temp_EPD_fb_4bit_DataPointH -= 300;
+				}
+
+				if(temp_width_changed){
+					if( width < x1) x1 = width; //find smallest point
+					if( width > x2) x2 = width; //find largest point
+					temp_width_changed = false;
+				}
+				temp_tx_buf_DataPointW += (actual_stride*2);//yuchen (every two stride)
+				temp_EPD_fb_4bit_DataPointW--;
+			}
+			mdss_spi_tx_parameter(EPD_fb_4bit, TOTAL_PIXEL_ARY_CNT + 2);
+		}//Fine tune End
+
+		//<2018/10/08,Yuchen-[4101]partial update
+		x1 = (x1-EXT_UPDATE_PIXEL)<0   ? 0   : (x1-EXT_UPDATE_PIXEL);
+		x2 = (x2+EXT_UPDATE_PIXEL)>600 ? 600 : (x2+EXT_UPDATE_PIXEL);
+		y1 = (y1-EXT_UPDATE_PIXEL)<0   ? 0   : (y1-EXT_UPDATE_PIXEL);
+		y2 = (y2+EXT_UPDATE_PIXEL)>480 ? 480 : (y2+EXT_UPDATE_PIXEL);
+
+		if( (x1 < x2) && (y1 < y2) ){
+			#if debug_panel
+				pr_err("[YC] partial update x1[%d]- x2[%d], y1[%d]-y2[%d]\n", x1, x2, y1, y2);
+			#endif
+
+			temp_coordinate = (x1 & 0xffff)>>8;
+			parm_b5_partial[2]=temp_coordinate;
+			temp_coordinate = (x1 & 0xff);
+			parm_b5_partial[3]=temp_coordinate;//set X
+
+			temp_coordinate = (y1 & 0xffff)>>8;
+			parm_b5_partial[4]=temp_coordinate;
+			temp_coordinate = (y1 & 0xff);
+			parm_b5_partial[5]=temp_coordinate;//set Y
+
+			temp_coordinate = ((x2-x1+2) & 0xffff)>>8;
+			parm_b5_partial[6]=temp_coordinate;
+			temp_coordinate = ((x2-x1+2) & 0xff);
+			parm_b5_partial[7]=temp_coordinate;//set W
+
+			temp_coordinate = ((y2-y1+1) & 0xffff)>>8;
+			parm_b5_partial[8]=temp_coordinate;
+			temp_coordinate = ((y2-y1+1) & 0xff);
+			parm_b5_partial[9]=temp_coordinate;//set L
+
+			#if debug_panel
+				pr_err("[YC] X[0x%x 0x%x]- Y[0x%x 0x%x]\n", parm_b5_partial[2], parm_b5_partial[3], parm_b5_partial[4], parm_b5_partial[5]);
+				pr_err("[YC] W[0x%x 0x%x]- L[0x%x 0x%x]\n", parm_b5_partial[6], parm_b5_partial[7], parm_b5_partial[8], parm_b5_partial[9]);
+			#endif
+
+			mdss_spi_tx_parameter(parm_b5_partial,sizeof(parm_b5_partial));
+		}else{
+			mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5));
+		}
+		//>2018/10/08,Yuchen
+
+		mutex_unlock(&ctrl_pdata->spi_tx_mutex);
+		msleep(480);
+		while(1){
+			busy_n=check_busy_n_status(ctrl_pdata->disp_busy_gpio);
+			if(busy_n==1) break;
+		}
+		//schedule_delayed_work(&epd_pof_work,msecs_to_jiffies(3000));//[Raymond]three seconds Power Off command Implementation
+		mdss_spi_tx_parameter(POF_REG,sizeof(POF_REG)); //POF
+	}//if bNeedUpdate
 
 	return rc;
 }
+//>2019/03/20,Yuchen
 
 static int mdss_spi_read_panel_data(struct mdss_panel_data *pdata,
 		u8 reg_addr, u8 *data, u8 len)
 {
 	int rc = 0;
 	struct spi_panel_data *ctrl_pdata = NULL;
+	pr_err("%s ++\n",__func__);
 
 	ctrl_pdata = container_of(pdata, struct spi_panel_data,
 		panel_data);
 
 	mutex_lock(&ctrl_pdata->spi_tx_mutex);
-	gpio_direction_output(ctrl_pdata->disp_dc_gpio, 0);
+	//gpio_direction_output(ctrl_pdata->disp_dc_gpio, 0);
 	rc = mdss_spi_read_data(reg_addr, data, len);
-	gpio_direction_output(ctrl_pdata->disp_dc_gpio, 1);
+	//gpio_direction_output(ctrl_pdata->disp_dc_gpio, 1);
 	mutex_unlock(&ctrl_pdata->spi_tx_mutex);
-
+	pr_err("%s --\n",__func__);
 	return rc;
 }
 
-static int mdss_spi_panel_on(struct mdss_panel_data *pdata)
+//raymond test b
+	char parm1[]={0x01, 0x03 ,0x04 ,0x00 ,0x00};
+	char parm2[]={0x00, 0x25, 0x00};
+	char parm3[]={0x26, 0x82};
+	char parm4[]={0x03, 0x03};
+	char parm5[]={0x07, 0xEF, 0xEF, 0x28};
+	char parm6[]={0xE0, 0x02};
+	char parm7[]={0x30, 0x0E};
+	char parm8[]={0x41, 0x00};
+	char parm9[]={0x50, 0x01, 0x22};
+	char parm10[]={0x60, 0x3F, 0x09, 0x2D};
+	char parm11[]={0x61, 0x02, 0x60, 0x01, 0xE0};
+	char parm12[]={0xE0, 0x02};
+	//char parm13[]={0x82, 0x4A};//vcom -3.7v
+	//ar parm13[]={0x82, 0x48};//vcom -3.6v
+	char parm13[]={0x82, 0x31};//vcom -2.45
+	char para_vcom[2]={0x82, 0x31}; //vcom -2.45
+	//char parm13[]={0x80, 0x51};//AMV
+	//char parm13[]={0x82, 0x14};//vcom
+//Upload_Temperature_LUT b
+       //char parm14[]={0x40};
+       //LUTC
+       char LUTC[65];
+      char parm15[65]={0x20,0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00};
+	   //LUTD
+	   char LUTD[16386];
+       char parm16[16386]={0x21,0x2B, 0x20, 0x20, 0x00, 0x20, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+0x20, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x80, 0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x02, 0x02, 0x00, 0x00, 0x02,
+0x20, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x20,
+0x00, 0x00, 0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00, 0x00, 0x20,
+0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+0x20, 0x00, 0x00, 0x00, 0x80, 0x20, 0x20, 0x22, 0x20, 0x00, 0x20, 0x02, 0x02, 0x00, 0x02, 0x0A,
+0x20, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x20,
+0x00, 0x00, 0x20, 0x20, 0x20, 0x20, 0x02, 0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00, 0x00, 0x20,
+0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x02,
+0x20, 0x00, 0x00, 0x00, 0x80, 0x20, 0x20, 0x22, 0x20, 0x00, 0x20, 0x02, 0x82, 0x00, 0xA2, 0x0A,
+0x22, 0x00, 0x20, 0x0A, 0x8A, 0x00, 0x20, 0x00, 0x28, 0x00, 0x00, 0x20, 0x20, 0x00, 0x00, 0x20,
+0x20, 0x00, 0x20, 0x20, 0x20, 0x20, 0x22, 0x20, 0x20, 0x20, 0x20, 0x02, 0x20, 0x00, 0x00, 0x20,
+0x00, 0x08, 0x00, 0x20, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x88, 0x00, 0x00, 0x02,
+0x28, 0x20, 0x00, 0x00, 0x80, 0x20, 0x20, 0x22, 0xA0, 0x00, 0x22, 0x0A, 0xA2, 0x02, 0xA2, 0x2A,
+0xA2, 0x00, 0x20, 0x0A, 0xAA, 0x00, 0x20, 0x22, 0x28, 0x00, 0x00, 0x20, 0x20, 0x00, 0x00, 0x20,
+0x20, 0x00, 0x22, 0x20, 0x20, 0x28, 0x22, 0x20, 0x20, 0x28, 0x22, 0x02, 0xA0, 0x00, 0x00, 0x20,
+0x00, 0x08, 0x20, 0x20, 0x08, 0x00, 0x00, 0x00, 0x2A, 0x20, 0x00, 0x02, 0x88, 0x00, 0x00, 0x02,
+0x28, 0x20, 0x00, 0x00, 0x80, 0x22, 0x22, 0x22, 0xA0, 0x00, 0x22, 0x2A, 0xA2, 0x2A, 0xA2, 0x2A,
+0xA2, 0x00, 0x28, 0x0A, 0xAA, 0x00, 0x22, 0x2A, 0x28, 0x00, 0x08, 0x20, 0x28, 0x00, 0x20, 0x22,
+0x28, 0x00, 0x22, 0x22, 0x28, 0x28, 0x22, 0x22, 0x28, 0x28, 0x22, 0x02, 0xA8, 0x08, 0x00, 0x20,
+0x00, 0x08, 0x28, 0x20, 0x08, 0x00, 0x00, 0x00, 0x2A, 0x20, 0x00, 0x02, 0xA8, 0x00, 0x00, 0x02,
+0xA8, 0x22, 0x00, 0x00, 0x80, 0x22, 0x22, 0x22, 0xA0, 0x00, 0x22, 0x2A, 0xAA, 0x2A, 0xA2, 0x2A,
+0xA2, 0x00, 0x28, 0x0A, 0xAA, 0x00, 0x2A, 0x2A, 0xA8, 0x00, 0x08, 0x22, 0xA8, 0x00, 0x2A, 0x22,
+0xA8, 0x00, 0x2A, 0x22, 0x28, 0x28, 0x2A, 0x2A, 0xA8, 0x28, 0x2A, 0x22, 0xA8, 0x08, 0x20, 0x22,
+0x20, 0x08, 0x28, 0x20, 0x08, 0x00, 0x20, 0x00, 0x2A, 0x20, 0x00, 0x0A, 0xA8, 0x00, 0x00, 0x0A,
+0xA8, 0x22, 0x00, 0x00, 0x80, 0x22, 0x22, 0x2A, 0xA0, 0x00, 0x22, 0x2A, 0xAA, 0x2A, 0xA2, 0xAA,
+0xA2, 0x00, 0x28, 0x0A, 0xAA, 0x00, 0x2A, 0x2A, 0xA8, 0x00, 0x28, 0x2A, 0xA8, 0x00, 0x2A, 0x22,
+0xA8, 0x00, 0x2A, 0x2A, 0x28, 0x28, 0x2A, 0x2A, 0xA8, 0x28, 0x2A, 0x2A, 0xA8, 0x08, 0x22, 0x22,
+0x20, 0x08, 0x28, 0x22, 0x28, 0x00, 0x20, 0x08, 0x2A, 0x20, 0x20, 0x0A, 0xA8, 0x00, 0x20, 0x0A,
+0xA8, 0x22, 0x88, 0x08, 0x80, 0x22, 0x22, 0xAA, 0xA0, 0x00, 0xA2, 0x2A, 0xAA, 0x2A, 0xA2, 0xAA,
+0xA2, 0x08, 0x2A, 0x0A, 0xAA, 0x08, 0x2A, 0x2A, 0xA8, 0x00, 0x28, 0x2A, 0xA8, 0x00, 0x2A, 0x22,
+0xA8, 0x00, 0x2A, 0x2A, 0xA8, 0x28, 0x2A, 0x2A, 0xA8, 0x28, 0x2A, 0x2A, 0xA8, 0x28, 0x2A, 0x22,
+0x2A, 0x28, 0x2A, 0x22, 0x28, 0x00, 0x20, 0x88, 0x29, 0x20, 0x20, 0x0A, 0xAA, 0x00, 0x20, 0x0A,
+0xA8, 0x22, 0x88, 0x28, 0x80, 0x2A, 0xA2, 0xAA, 0xA8, 0x00, 0xA2, 0x2A, 0xAA, 0x2A, 0xAA, 0xAA,
+0xAA, 0x08, 0x2A, 0x2A, 0xAA, 0x08, 0x2A, 0x2A, 0xA8, 0x00, 0x2A, 0x2A, 0xAA, 0x00, 0x2A, 0x2A,
+0xA8, 0x00, 0x2A, 0x2A, 0xA8, 0x28, 0x2A, 0x2A, 0xA8, 0x28, 0x2A, 0x2A, 0xA8, 0x28, 0x2A, 0x22,
+0xAA, 0x28, 0x2A, 0x22, 0xAA, 0x08, 0x28, 0x88, 0x29, 0x20, 0x20, 0x0A, 0xAA, 0x20, 0x20, 0x8A,
+0xAA, 0x22, 0x88, 0xAA, 0x80, 0x2A, 0xA2, 0xAA, 0xA8, 0x28, 0xAA, 0xAA, 0xAA, 0x2A, 0xAA, 0xAA,
+0xAA, 0x08, 0xAA, 0xAA, 0xAA, 0x08, 0x2A, 0x2A, 0xA8, 0x20, 0x2A, 0x2A, 0xAA, 0x20, 0x2A, 0x2A,
+0xAA, 0x00, 0x2A, 0x2A, 0xA8, 0x2A, 0x2A, 0x2A, 0xA8, 0x2A, 0x2A, 0xAA, 0xA8, 0x28, 0x2A, 0x22,
+0xAA, 0x28, 0x2A, 0x22, 0xAA, 0x28, 0x28, 0xA8, 0x29, 0x28, 0x20, 0x0A, 0xAA, 0x28, 0x20, 0x8A,
+0xAA, 0x22, 0x88, 0xAA, 0x80, 0x2A, 0xAA, 0xAA, 0xA8, 0x28, 0xAA, 0xAA, 0xAA, 0x2A, 0xAA, 0xAA,
+0xAA, 0x08, 0xAA, 0xAA, 0xAA, 0x28, 0xAA, 0xAA, 0xA8, 0x28, 0x2A, 0x2A, 0xAA, 0x28, 0x2A, 0x2A,
+0xAA, 0x00, 0xAA, 0x2A, 0xA8, 0x2A, 0xAA, 0x2A, 0xA8, 0x2A, 0xAA, 0xAA, 0xA8, 0x28, 0x2A, 0x22,
+0xAA, 0x28, 0x2A, 0x22, 0xAA, 0x28, 0x28, 0xA8, 0x29, 0x28, 0xA0, 0x8A, 0xA5, 0x28, 0xA0, 0x8A,
+0x96, 0x22, 0x88, 0xAA, 0x88, 0x2A, 0xAA, 0xAA, 0xA8, 0x28, 0xAA, 0xAA, 0xAA, 0x2A, 0xAA, 0xAA,
+0xAA, 0x28, 0xAA, 0xAA, 0xAA, 0x28, 0xAA, 0xAA, 0xA8, 0x28, 0x2A, 0xAA, 0xAA, 0x28, 0x2A, 0xAA,
+0xAA, 0x00, 0xAA, 0x2A, 0xAA, 0x2A, 0xAA, 0x2A, 0xAA, 0x2A, 0xAA, 0xAA, 0xA8, 0x28, 0x2A, 0x22,
+0xAA, 0x28, 0x2A, 0x22, 0xAA, 0x28, 0xA8, 0xAA, 0x25, 0x28, 0xA0, 0x8A, 0xA5, 0x28, 0xA8, 0x89,
+0x95, 0x21, 0x68, 0xAA, 0x08, 0x2A, 0xAA, 0xAA, 0xA8, 0x28, 0xAA, 0xAA, 0xAA, 0x2A, 0xAA, 0xAA,
+0xA9, 0x28, 0xAA, 0xAA, 0xA9, 0x28, 0xAA, 0xAA, 0xA8, 0x2A, 0x2A, 0xAA, 0xAA, 0x28, 0x2A, 0xAA,
+0xAA, 0x20, 0xAA, 0xAA, 0xAA, 0x2A, 0xAA, 0xAA, 0xAA, 0x2A, 0xAA, 0xAA, 0xAA, 0x28, 0x2A, 0xAA,
+0xAA, 0x24, 0x2A, 0x2A, 0xA6, 0x28, 0xA8, 0xAA, 0x95, 0x28, 0xA0, 0xA9, 0x95, 0x28, 0xA8, 0xA9,
+0x95, 0x11, 0x68, 0xAA, 0x68, 0x2A, 0xAA, 0xAA, 0xA8, 0x28, 0xAA, 0xAA, 0xA9, 0x2A, 0xAA, 0xAA,
+0xA9, 0x28, 0xAA, 0xAA, 0xA9, 0x28, 0xAA, 0xAA, 0xAA, 0x2A, 0x2A, 0xAA, 0xAA, 0x28, 0x2A, 0xAA,
+0xAA, 0x28, 0xAA, 0xAA, 0xAA, 0x2A, 0xAA, 0xAA, 0xAA, 0x2A, 0xAA, 0xAA, 0xAA, 0x28, 0x2A, 0x8A,
+0xA9, 0x24, 0x2A, 0x1A, 0xA5, 0x28, 0xAA, 0xAA, 0x95, 0x18, 0xA8, 0xA9, 0x55, 0x28, 0xA8, 0xA9,
+0x95, 0x11, 0x64, 0x66, 0x68, 0x2A, 0xAA, 0xAA, 0xA8, 0x2A, 0xAA, 0xAA, 0xA9, 0x2A, 0xAA, 0xAA,
+0xA9, 0x2A, 0xAA, 0xAA, 0xA9, 0x28, 0xAA, 0xAA, 0xAA, 0x2A, 0x2A, 0xAA, 0xAA, 0x28, 0xAA, 0x9A,
+0xAA, 0x28, 0xAA, 0xAA, 0xAA, 0x1A, 0xAA, 0xAA, 0xAA, 0x1A, 0xAA, 0xAA, 0xAA, 0x28, 0x2A, 0x8A,
+0xA9, 0x26, 0x2A, 0x1A, 0xA5, 0x28, 0xAA, 0x2A, 0x95, 0x18, 0xA8, 0xA5, 0x55, 0x28, 0xA8, 0x25,
+0x95, 0x11, 0x64, 0x55, 0x54, 0x2A, 0xAA, 0xAA, 0xA8, 0x2A, 0xAA, 0xAA, 0xA9, 0x2A, 0xAA, 0xAA,
+0xA9, 0x2A, 0xAA, 0xAA, 0xA9, 0x2A, 0xAA, 0xAA, 0xAA, 0x2A, 0x2A, 0xAA, 0x9A, 0x28, 0xAA, 0x9A,
+0xAA, 0x28, 0xAA, 0x9A, 0x9A, 0x1A, 0xAA, 0x9A, 0x9A, 0x1A, 0xAA, 0xAA, 0x9A, 0x26, 0x2A, 0x9A,
+0xA9, 0x2A, 0x26, 0x9A, 0xA5, 0x28, 0x9A, 0x66, 0x95, 0x18, 0x98, 0x25, 0x55, 0x28, 0x9A, 0x65,
+0x55, 0x11, 0x64, 0x55, 0x54, 0x2A, 0xAA, 0xAA, 0xA8, 0x2A, 0xAA, 0xAA, 0xA9, 0x2A, 0xAA, 0xAA,
+0x89, 0x2A, 0xAA, 0xAA, 0xA5, 0x2A, 0xAA, 0xAA, 0x96, 0x2A, 0xAA, 0x9A, 0x95, 0x28, 0xAA, 0x9A,
+0x95, 0x28, 0x8A, 0x9A, 0x96, 0x2A, 0xA9, 0x9A, 0x96, 0x2A, 0xAA, 0xAA, 0x96, 0x26, 0x2A, 0x9A,
+0x95, 0x2A, 0x16, 0x9A, 0x95, 0x26, 0x96, 0x56, 0x95, 0x14, 0x5A, 0x65, 0x55, 0x14, 0x5A, 0x65,
+0x55, 0x11, 0x66, 0x55, 0x54, 0x1A, 0xAA, 0xAA, 0x98, 0x2A, 0xAA, 0xAA, 0xA9, 0x2A, 0xAA, 0xAA,
+0x99, 0x2A, 0xAA, 0xAA, 0xA5, 0x2A, 0xAA, 0x9A, 0x96, 0x2A, 0xA6, 0x9A, 0x95, 0x28, 0xAA, 0x9A,
+0x95, 0x28, 0x99, 0x9A, 0x96, 0x2A, 0xA9, 0x9A, 0x96, 0x2A, 0x99, 0xA9, 0x96, 0x26, 0x25, 0x99,
+0x95, 0x2A, 0x15, 0x99, 0x95, 0x16, 0x56, 0x56, 0x95, 0x16, 0x5A, 0x55, 0x55, 0x16, 0x56, 0x55,
+0x55, 0x19, 0x56, 0x55, 0x54, 0x1A, 0xAA, 0x9A, 0x98, 0x2A, 0xAA, 0xA9, 0xA9, 0x1A, 0x68, 0xA5,
+0x99, 0x2A, 0xAA, 0xA4, 0xA5, 0x2A, 0xAA, 0x98, 0x96, 0x26, 0xA6, 0x98, 0x95, 0x24, 0xA5, 0x99,
+0x95, 0x28, 0x95, 0x99, 0x95, 0x06, 0x95, 0x95, 0x95, 0x06, 0x95, 0x99, 0x96, 0x26, 0x15, 0x99,
+0x95, 0x16, 0x15, 0x99, 0x95, 0x16, 0x55, 0x55, 0x95, 0x16, 0x56, 0x55, 0x55, 0x16, 0x56, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x54, 0x2A, 0x8A, 0x98, 0x98, 0x2A, 0x8A, 0xA9, 0xA9, 0x19, 0x69, 0x95,
+0x99, 0x2A, 0x96, 0xA5, 0x95, 0x2A, 0x95, 0x95, 0x96, 0x26, 0xA6, 0x95, 0x95, 0x26, 0x95, 0x99,
+0x95, 0x2A, 0x95, 0x95, 0x95, 0x06, 0x95, 0x95, 0x95, 0x06, 0x95, 0x55, 0x55, 0x16, 0x95, 0x59,
+0x95, 0x16, 0x15, 0x99, 0x55, 0x15, 0x55, 0x55, 0x95, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x54, 0x2A, 0x9A, 0x99, 0x98, 0x2A, 0x99, 0x95, 0x95, 0x19, 0x59, 0x55,
+0x99, 0x26, 0x96, 0xA5, 0x55, 0x26, 0x95, 0x95, 0x96, 0x26, 0x95, 0x55, 0x55, 0x26, 0x95, 0x55,
+0x55, 0x2A, 0x55, 0x95, 0x95, 0x15, 0x55, 0x95, 0x55, 0x15, 0x55, 0x55, 0x55, 0x16, 0x95, 0x59,
+0x55, 0x16, 0x95, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x54, 0x09, 0x99, 0x59, 0x98, 0x2A, 0x59, 0x95, 0x55, 0x25, 0x59, 0x55,
+0x55, 0x26, 0x55, 0x55, 0x55, 0x26, 0x55, 0x55, 0x55, 0x06, 0x95, 0x55, 0x55, 0x06, 0x95, 0x55,
+0x55, 0x26, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x16, 0x95, 0x55,
+0x55, 0x15, 0x95, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x54, 0x15, 0x59, 0x51, 0x54, 0x26, 0x59, 0x55, 0x55, 0x25, 0x55, 0x55,
+0x54, 0x26, 0x55, 0x55, 0x55, 0x26, 0x55, 0x55, 0x55, 0x15, 0x95, 0x55, 0x55, 0x16, 0x55, 0x55,
+0x55, 0x26, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x95, 0x55,
+0x55, 0x15, 0x95, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x54, 0x15, 0x59, 0x55, 0x54, 0x26, 0x55, 0x55, 0x55, 0x25, 0x55, 0x55,
+0x54, 0x26, 0x55, 0x55, 0x55, 0x16, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x16, 0x55, 0x55,
+0x55, 0x16, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x55, 0x95, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x54, 0x95, 0x55, 0x55, 0x56, 0x16, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x54, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x16, 0x55, 0x55,
+0x55, 0x16, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x55, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55, 0x55, 0x95, 0x55, 0x55,
+0x55, 0x15, 0x55, 0x55, 0x54, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x55, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x54, 0x15, 0x55, 0x55, 0x54, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55, 0x54, 0x95, 0x55, 0x55,
+0x54, 0x15, 0x55, 0x55, 0x54, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55, 0x54, 0x95, 0x55, 0x55,
+0x56, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x54, 0x15, 0x55, 0x55, 0x54, 0x55, 0x55, 0x55, 0x56, 0x55, 0x55, 0x55, 0x56, 0x55, 0x55, 0x55,
+0x54, 0x55, 0x55, 0x55, 0x54, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55,
+0x56, 0x15, 0x55, 0x55, 0x56, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x56, 0x15, 0x55, 0x55, 0x56, 0x55, 0x55, 0x55, 0x56, 0x55, 0x55, 0x55, 0x56, 0x55, 0x55, 0x55,
+0x56, 0x55, 0x55, 0x55, 0x44, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55,
+0x56, 0x15, 0x55, 0x55, 0x56, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x56, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55, 0x54, 0x15, 0x55, 0x55,
+0x56, 0x15, 0x55, 0x55, 0x5A, 0x55, 0x55, 0x55, 0x5A, 0x55, 0x55, 0x55, 0x5A, 0x55, 0x55, 0x55,
+0x5A, 0x55, 0x55, 0x55, 0x44, 0x95, 0x55, 0x55, 0x46, 0x95, 0x55, 0x55, 0x56, 0x95, 0x55, 0x55,
+0x56, 0x15, 0x55, 0x55, 0x5A, 0x15, 0x55, 0x55, 0x58, 0x15, 0x55, 0x55, 0x5A, 0x15, 0x55, 0x55,
+0x5A, 0x15, 0x55, 0x55, 0x58, 0x15, 0x55, 0x55, 0x58, 0x15, 0x55, 0x55, 0x58, 0x95, 0x55, 0x55,
+0x5A, 0x15, 0x55, 0x55, 0x5A, 0x55, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55,
+0x6A, 0x55, 0x55, 0x55, 0x68, 0x95, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x55, 0x5A, 0x95, 0x55, 0x55,
+0x6A, 0x15, 0x55, 0x55, 0x5A, 0x15, 0x55, 0x55, 0x68, 0x19, 0x55, 0x55, 0x6A, 0x19, 0x55, 0x55,
+0x6A, 0x15, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x55, 0x68, 0x95, 0x55, 0x55,
+0x6A, 0x95, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55,
+0x6A, 0x55, 0x15, 0x55, 0x68, 0x95, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x55,
+0x6A, 0x95, 0x55, 0x55, 0x6A, 0x15, 0x55, 0x55, 0x6A, 0x19, 0x55, 0x55, 0x6A, 0x19, 0x55, 0x55,
+0x6A, 0x15, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55,
+0x6A, 0x55, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x55,
+0x6A, 0x55, 0x15, 0x55, 0x68, 0x95, 0x55, 0x15, 0x6A, 0x95, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x51,
+0x6A, 0x95, 0x55, 0x51, 0x6A, 0x95, 0x55, 0x65, 0x6A, 0x15, 0x59, 0x15, 0x6A, 0x15, 0x55, 0x05,
+0x6A, 0x15, 0x55, 0x55, 0x6A, 0x95, 0x55, 0x51, 0x6A, 0x95, 0x55, 0x15, 0x6A, 0x55, 0x59, 0x15,
+0x6A, 0x55, 0x59, 0x15, 0x2A, 0x55, 0x55, 0x55, 0x6A, 0x55, 0x55, 0x56, 0x2A, 0x55, 0x55, 0x56,
+0x6A, 0x56, 0x15, 0x12, 0x68, 0x55, 0x95, 0x16, 0x2A, 0x55, 0x95, 0x12, 0x2A, 0x55, 0x95, 0x12,
+0x2A, 0x95, 0x99, 0x12, 0x2A, 0x95, 0x99, 0x12, 0x2A, 0x15, 0x95, 0x12, 0x2A, 0x15, 0x99, 0x02,
+0x2A, 0x19, 0x99, 0x12, 0x2A, 0x55, 0x99, 0x12, 0x2A, 0x55, 0x99, 0x12, 0x2A, 0x59, 0x95, 0x16,
+0x2A, 0x55, 0x95, 0x12, 0x2A, 0x56, 0x54, 0x9A, 0x2A, 0x56, 0x54, 0x9A, 0xAA, 0x56, 0x55, 0x9A,
+0xAA, 0x56, 0x10, 0x9A, 0xA8, 0x51, 0x51, 0x8A, 0xAA, 0x51, 0x51, 0x9A, 0xAA, 0x55, 0x51, 0x9A,
+0xAA, 0x91, 0x55, 0xAA, 0xAA, 0x95, 0x55, 0x8A, 0xAA, 0x91, 0x51, 0x8A, 0xAA, 0x91, 0x54, 0x8A,
+0xAA, 0x95, 0x54, 0x8A, 0xAA, 0x55, 0x54, 0x8A, 0xAA, 0x55, 0x54, 0x9A, 0xAA, 0x55, 0x50, 0x9A,
+0xAA, 0x55, 0x50, 0x9A, 0xAA, 0x56, 0x08, 0x8A, 0xAA, 0x56, 0x08, 0x8A, 0xAA, 0x56, 0x08, 0x8A,
+0xAA, 0x59, 0x18, 0x9A, 0xA8, 0x51, 0x1A, 0xAA, 0xAA, 0x52, 0x1A, 0xAA, 0xAA, 0x56, 0x1A, 0xAA,
+0xAA, 0x52, 0x0A, 0x9A, 0xAA, 0x5A, 0x1A, 0x8A, 0xAA, 0x51, 0x1A, 0xAA, 0xAA, 0x52, 0x1A, 0xAA,
+0xAA, 0x52, 0x1A, 0xAA, 0xAA, 0x56, 0x1A, 0xAA, 0xAA, 0x56, 0x1A, 0xAA, 0xAA, 0x51, 0x1A, 0xAA,
+0xAA, 0x55, 0x0A, 0xAA, 0xAA, 0x55, 0x0A, 0xAA, 0xAA, 0x55, 0x0A, 0xAA, 0xAA, 0x55, 0x0A, 0xAA,
+0xAA, 0x55, 0x0A, 0xAA, 0xA8, 0x52, 0x2A, 0xAA, 0xAA, 0x52, 0x2A, 0xAA, 0xAA, 0x56, 0x2A, 0xAA,
+0xAA, 0x52, 0x2A, 0xAA, 0xAA, 0x56, 0x2A, 0xAA, 0xAA, 0x52, 0x2A, 0xAA, 0xAA, 0x52, 0x2A, 0xAA,
+0xAA, 0x52, 0x2A, 0xAA, 0xAA, 0x56, 0x2A, 0xAA, 0xAA, 0x56, 0x2A, 0xAA, 0xAA, 0x52, 0x2A, 0xAA,
+0xAA, 0x56, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA, 0xAA, 0x41, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA,
+0xAA, 0x50, 0x0A, 0xAA, 0xA8, 0x51, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA, 0xAA, 0x55, 0x2A, 0xAA,
+0xAA, 0x51, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA,
+0xAA, 0x51, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA, 0xAA, 0x51, 0x2A, 0xAA,
+0xAA, 0x59, 0x2A, 0xAA, 0xAA, 0x58, 0xAA, 0xAA, 0xAA, 0x48, 0xAA, 0xAA, 0xAA, 0x58, 0xAA, 0xAA,
+0xAA, 0x58, 0xAA, 0xAA, 0xA8, 0x5A, 0x82, 0x6A, 0xA2, 0x5A, 0x82, 0x6A, 0xA2, 0x5A, 0x82, 0x6A,
+0xA2, 0x5A, 0x82, 0x6A, 0xA2, 0x5A, 0x82, 0x6A, 0xA2, 0x5A, 0x82, 0x6A, 0xA2, 0x5A, 0x82, 0x6A,
+0xA2, 0x5A, 0x82, 0x6A, 0xA2, 0x5A, 0x82, 0x6A, 0xA2, 0x5A, 0x82, 0x6A, 0xA2, 0x5A, 0x82, 0x6A,
+0xA2, 0x4A, 0x82, 0x6A, 0xA2, 0x6A, 0x82, 0x6A, 0xA2, 0x4A, 0x82, 0x6A, 0xA2, 0x6A, 0x82, 0x6A,
+0xA2, 0x6A, 0xA2, 0x6A, 0xA0, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05,
+0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05,
+0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05,
+0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05, 0x02, 0x42, 0x85, 0x05,
+0x02, 0x42, 0x85, 0x05, 0x00, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15,
+0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15,
+0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15,
+0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15, 0x54, 0x41, 0x10, 0x15,
+0x54, 0x41, 0x10, 0x15, 0x54, 0x44, 0x60, 0x2A, 0x88, 0x45, 0x60, 0x2A, 0x88, 0x45, 0x60, 0x2A,
+0x88, 0x45, 0x60, 0x2A, 0x88, 0x45, 0x60, 0x2A, 0x88, 0x44, 0x60, 0x2A, 0x88, 0x45, 0x60, 0x2A,
+0x88, 0x45, 0x60, 0x2A, 0x88, 0x45, 0x60, 0x2A, 0x88, 0x45, 0x60, 0x2A, 0x88, 0x44, 0x60, 0x2A,
+0x88, 0x44, 0x60, 0x2A, 0x88, 0x44, 0x60, 0x2A, 0x88, 0x44, 0x60, 0x2A, 0x88, 0x44, 0x60, 0x2A,
+0x88, 0x44, 0x60, 0x2A, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00
+ };
+//LUTR
+char LUTR[257];
+char parm16_1[257]={0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+//Upload_Temperature_LUT e
+//EPD_DTM2_Initial b
+        char parm17[]={0x83, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};
+	//char parm18[36002] = { 0x00 }; //black
+	//char parm18_1[36002] = { 0xFF }; //white
+//EPD_DTM2_Initial e
+	char parm19[]={0x04}; //PON
+	//char parm20[]={02}; //POF
+
+//EPD white b
+     char parm21[]={0x83, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};
+     //char parm22[36002] = { 0x00 }; //black
+     //char parm22_1[36002] ; //white
+     char parm23[]={0xE0, 0x02};
+     char parm24[]={0x04}; //PON
+     char parm25[]={0x12, 0x18, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};//DRF
+     char parm26[]={02}; //POF
+//EPD white e
+//EPD black b
+     char parm_b1[]={0x83, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x01, 0xE0};
+     char parm_b2[TOTAL_PIXEL_ARY_CNT+2] = { 0x00 }; //black //2018/10/08,Yuchen- [4101] 144002 -> TOTAL_PIXEL_ARY_CNT+2
+     char parm_dtm2[TOTAL_PIXEL_ARY_CNT+2] = { 0x00 }; //DTM2
+     char parm_b3[]={0xE0, 0x02};
+     char parm_b4[]={0x04}; //PON
+     //char parm_b5[]={0x12, 0x18, 0x00, 0x00, 0x00, 0x00, 0x02, 0x58, 0x02, 0xE0};
+     char parm_b6[]={02}; //POF
+//EPD black e
+//raymond test e
+//[4101][Raymond]Dynamic change waveform mode - brgin
+static int change_waveform_mode(struct mdss_panel_data *pdata, unsigned int Mode)
 {
+	unsigned int t=0;
+	int tsc_t;
+	int busy_n,i;
+	int ret =0;
+	unsigned int offset = 0;
+	unsigned int segment = 0;
 	struct spi_panel_data *ctrl = NULL;
 	struct mdss_panel_info *pinfo;
-	int i;
+	//struct file *file;
+	//const struct firmware *cfg = NULL;
+	unsigned int frame;
+	int LUTD_Count;
 
+#if 1
+	pr_err("%s ++\n",__func__);
+#endif
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
 		return -EINVAL;
@@ -496,24 +1817,416 @@ static int mdss_spi_panel_on(struct mdss_panel_data *pdata)
 	ctrl = container_of(pdata, struct spi_panel_data,
 				panel_data);
 
-	for (i = 0; i < ctrl->on_cmds.cmd_cnt; i++) {
-		/* pull down dc gpio indicate this is command */
-		gpio_direction_output(ctrl->disp_dc_gpio, 0);
-		mdss_spi_tx_command(ctrl->on_cmds.cmds[i].command);
-		gpio_direction_output((ctrl->disp_dc_gpio), 1);
-
-		if (ctrl->on_cmds.cmds[i].dchdr.dlen > 1) {
-			mdss_spi_tx_parameter(ctrl->on_cmds.cmds[i].parameter,
-					ctrl->on_cmds.cmds[i].dchdr.dlen-1);
-		}
-		if (ctrl->on_cmds.cmds[i].dchdr.wait != 0)
-			msleep(ctrl->on_cmds.cmds[i].dchdr.wait);
+	mdss_spi_tx_parameter(PON_REG,sizeof(PON_REG)); //PON
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	if(busy_n==1)
+		break;
 	}
 
+	//mutex_lock(&ctrl->spi_tx_mutex);
+	ret=mdss_spi_read_epd_data(TSC,ctrl->act_status_value,2);
+	//mutex_unlock(&ctrl->spi_tx_mutex);
+	if(ret<0)
+		pr_err("%s: Read TSC register returned error\n", __func__);
+
+	for (i = 0; i < 2; i++) {
+	pr_err("Read EPD TSC REG:0x40[%d] = 0x%x\n",i, ctrl->act_status_value[i]);
+	}
+
+	if(ctrl->act_status_value[1]>=128)
+		t=((ctrl->act_status_value[0]*2)+1);
+	else
+		t=(ctrl->act_status_value[0]*2);
+	pr_err("%s:1 Read TSC register t=%d \n", __func__,t);
+
+	//pr_err("%s:1 Read TSC register temperature=%d \n", __func__,(int)(t/2));
+
+
+	//t=(int) ((ctrl->act_status_value[0]&0xFF) | (( ctrl->act_status_value[1]&0x80) >>8) ) ;
+	//pr_err("%s:2 Read TSC register t=%d \n", __func__,t);
+
+      //segment value
+      tsc_t=t/2;
+	if (tsc_t<3)
+		segment = 0;
+	else if (tsc_t>=3&&tsc_t<6)
+		segment = 1;
+	else if (tsc_t>=6&&tsc_t<9)
+		segment = 2;
+	else if (tsc_t>=9&&tsc_t<12)
+		segment = 3;
+	else if (tsc_t>=12&&tsc_t<15)
+		segment = 4;
+	else if (tsc_t>=15&&tsc_t<18)
+		segment = 5;
+	else if (tsc_t>=18&&tsc_t<21)
+		segment = 6;
+	else if (tsc_t>=21&&tsc_t<24)
+		segment = 7;
+	else if (tsc_t>=24&&tsc_t<27)
+		segment = 8;
+	else if (tsc_t>=27&&tsc_t<30)
+		segment = 9;
+	else if (tsc_t>=30&&tsc_t<33)
+		segment = 10;
+	else if (tsc_t>=33&&tsc_t<38)
+		segment = 11;
+	else if (tsc_t>=38&&tsc_t<43)
+		segment = 12;
+	else if (tsc_t>=43&&tsc_t<50)
+		segment = 13;
+	else if (tsc_t>=50)
+		segment = 13;
+
+      if(ctrl->act_status_value[0]>=128) //Negative temperature
+      	{
+      	 pr_err("%s: Negative temperature \n", __func__);
+      	  segment=0;
+      	}
+	pr_err("%s: temperature=%d, segment=%d \n", __func__,tsc_t,segment);
+
+	switch(Mode){
+		case INIT:
+			offset = 16705*segment;
+		break;
+		case A2:
+			offset = 16705*(14+segment);
+		break;
+		case DU:
+			offset = 16705*(28+segment);
+		break;
+		case GL16:
+			offset = 16705*(42+segment);
+		break;
+		case GC16:
+			offset = 16705*(56+segment);
+		break;
+		default:
+			offset = 16705*(42+segment);
+		break;
+	}
+      pr_err("%s: Mode=%d, offset=%d \n", __func__,Mode,offset);
+	if(first_request==1){ //only request once
+	pr_err("%s  request config file %s\n",__func__,WF_FILE_NAME);
+	ret = request_firmware(&wf_file_cfg,WF_FILE_NAME,ctrl->dev);
+	if (ret < 0) { // if request fail, waveform mode is GL mode
+		pr_err("%s Failure to request config file %s\n",
+			__func__,WF_FILE_NAME);
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+	mdss_spi_tx_parameter(parm15,sizeof(parm15)); //LUTC
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+	mdss_spi_tx_parameter(parm16,sizeof(parm16)); //LUTD
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+	mdss_spi_tx_parameter(parm16_1,sizeof(parm16_1));//LUTR
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+	return ret;
+	}
+	}
+
+pr_err("fw: %02X, %02X, %02X, %02X, %02X, %02X \n",
+			wf_file_cfg->data[0],wf_file_cfg->data[1],wf_file_cfg->data[2],wf_file_cfg->data[3840],wf_file_cfg->data[3841],wf_file_cfg->data[3842]);
+
+       //LUTD
+       frame = wf_file_cfg->data[offset] +1;
+	LUTD_Count = frame * 64;
+	pr_err("frame=%d, LUTD_Count=%d \n",frame,LUTD_Count);
+	LUTD[0]=0x21;
+	pr_err("LUTD[0]=0x%X, ",LUTD[0]);
+       for(i=0;i<=LUTD_Count;i++){
+      		LUTD[i+1]= wf_file_cfg->data[i+offset];
+			//if(i<100 || i>LUTD_Count-100)
+			 //pr_err("LUTD[%d]=0x%X, ",i+1,LUTD[i+1]);
+       }
+
+//pr_err("LUTD[0]=0x%X , LUTD[1]=0x%X ,offset=%d \n",LUTD[0],LUTD[1],offset);
+	  //LUTC
+	  offset+=16385;
+	  LUTC[0]=0x20;
+	  pr_err("LUTC[0]=0x%X, ",LUTC[0]);
+	  for(i=0;i<64;i++){
+      		LUTC[i+1]= wf_file_cfg->data[i+offset];
+			// pr_err("LUTC[%d]=0x%X, ",i+1,LUTC[i+1]);
+       }
+//pr_err("LUTC[0]=0x%X , LUTC[1]=0x%X,offset=%d \n",LUTC[0],LUTC[1],offset);
+	  //LUTR
+	  offset+=64;
+	  LUTR[0]=0x22;
+	  pr_err("LUTR[0]=0x%X, ",LUTR[0]);
+	  for(i=0;i<256;i++){
+      		LUTR[i+1]= wf_file_cfg->data[i+offset];
+			 //pr_err("LUTR[%d]=0x%X, ",i+1,LUTR[i+1]);
+       }
+//pr_err("LUTR[0]=0x%X , LUTR[1]=0x%X, offset=%d \n",LUTR[0],LUTR[1],offset);
+//mutex_lock(&ctrl->spi_tx_mutex);
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+	  mdss_spi_tx_parameter(LUTC,sizeof(LUTC)); //LUTC
+	  //mdss_spi_tx_parameter(LUTC,65); //LUTC
+	  //mdss_spi_tx_parameter(parm15,sizeof(parm15)); //LUTC
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+
+	mdss_spi_tx_parameter(LUTD,sizeof(LUTD)); //LUTD
+	//mdss_spi_tx_parameter(parm16,sizeof(parm16)); //LUTD
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+
+	mdss_spi_tx_parameter(LUTR,sizeof(LUTR)); //LUTR
+	//mdss_spi_tx_parameter(parm16_1,sizeof(parm16_1));//LUTR
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+//mutex_unlock(&ctrl->spi_tx_mutex);
+	//release_firmware(cfg);
+       first_request=0;
+	#if 1
+	pr_err("%s --\n",__func__);
+#endif
+	return 0;
+}
+//[4101][Raymond]Dynamic change waveform mode - end
+
+struct mdss_panel_data *g_pdata = NULL;
+
+//[4101][Raymond]three seconds Power Off command Implementation - begin
+static void epd_pof_cmd(struct work_struct *data)
+{
+
+	//pr_err("%s ++,POF\n",__func__);
+	mdss_spi_tx_parameter(POF_REG,sizeof(POF_REG)); //POF
+	EPD_POF=1;
+	//pr_err("%s --\n",__func__);
+}
+
+//[4101][Raymond]three seconds Power Off command Implementation - end
+
+static int mdss_spi_panel_on(struct mdss_panel_data *pdata)
+{
+	struct spi_panel_data *ctrl = NULL;
+	struct mdss_panel_info *pinfo;
+	int busy_n;
+	int i;
+	//[4101][Raymond]off charging icon - begin
+  char xor_chr=0x00;//2019/02/23,Yuchen
+	int h_space, w_space;//2019/02/23,Yuchen distance from life-top
+	//[4101][Raymond]off charging icon - end
+	//int ret=0;
+#if 0
+	parm18[0] = 0x13;
+	parm18[1] = 0x00;
+	parm18_1[0] = 0x13;
+	parm18_1[1] = 0x00;
+	parm22_1[0] = 0x10;
+	parm22_1[1] = 0x00;
+#endif
+//[4101][Raymond]Fix screen abnormal in suspend - begin
+//bflash=1;
+panel_suspend=0;
+//[4101][Raymond]Fix screen abnormal in suspend - begin
+	parm_dtm2[0] = 0x13;
+	parm_dtm2[1] = 0x03;
+	bRemoteContentInconsistant = true;
+	g_pdata = pdata;
+#if 1
+	pr_err("%s ++\n",__func__);
+#endif
+	if (pdata == NULL) {
+		pr_err("%s: Invalid input data\n", __func__);
+		return -EINVAL;
+	}
+	pinfo = &pdata->panel_info;
+	ctrl = container_of(pdata, struct spi_panel_data,
+				panel_data);
+//memset(parm22_1,0xFF,36002);
+//memset(parm22_1,0xFF,18001); //half
+//memset(parm22_1,0xFF,40002); //double
+	//parm22_1[0] = 0x10;
+	//parm22_1[1] = 0x00;
+//pr_err("parm1 size:%d \n",sizeof(parm1));
+//pr_err("parm15 size:%d \n",sizeof(parm15));
+#if 1
+mdss_spi_tx_parameter(parm1,sizeof(parm1));
+mdss_spi_tx_parameter(parm2,sizeof(parm2));
+mdss_spi_tx_parameter(parm3,sizeof(parm3));
+mdss_spi_tx_parameter(parm4,sizeof(parm4));
+mdss_spi_tx_parameter(parm5,sizeof(parm5));
+mdss_spi_tx_parameter(parm6,sizeof(parm6));
+mdss_spi_tx_parameter(parm7,sizeof(parm7));
+mdss_spi_tx_parameter(parm8,sizeof(parm8));
+mdss_spi_tx_parameter(parm9,sizeof(parm9));
+mdss_spi_tx_parameter(parm10,sizeof(parm10));
+mdss_spi_tx_parameter(parm11,sizeof(parm11));
+mdss_spi_tx_parameter(parm12,sizeof(parm12));
+//mdss_spi_tx_parameter(parm13,sizeof(parm13));
+mdss_spi_tx_parameter(para_vcom,sizeof(para_vcom)); //write vcom
+for(i=0;i<sizeof(para_vcom);i++)
+{
+	pr_err("%s para_vcom[%d]=0x%X \n",__func__,i,para_vcom[i]);
+}
+
+//mdss_spi_tx_parameter(parm14,sizeof(parm14));
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+//pr_err("pon busy_n status:%d \n", busy_n);
+if(busy_n==1)
+	break;
+}
+#if 0
+pr_err("%s ++ , param15 \n",__func__);
+mdss_spi_tx_parameter(parm15,sizeof(parm15)); //LUTC
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+//pr_err("pon busy_n status:%d \n", busy_n);
+if(busy_n==1)
+	break;
+}
+mdss_spi_tx_parameter(parm16,sizeof(parm16)); //LUTD
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+//pr_err("pon busy_n status:%d \n", busy_n);
+if(busy_n==1)
+	break;
+}
+mdss_spi_tx_parameter(parm16_1,sizeof(parm16_1));//LUTR
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+//pr_err("pon busy_n status:%d \n", busy_n);
+if(busy_n==1)
+	break;
+}
+#else
+	pr_err("%s ++ , read bin \n",__func__);
+if(chg_mode==0){ // normal mode
+	change_waveform_mode(&ctrl->panel_data,wf_mode);
+}else{ // off charging mode
+	if(show_count==0){
+	change_waveform_mode(&ctrl->panel_data,0);
+	mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5));
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	//pr_err("pon busy_n status:%d \n", busy_n);
+	if(busy_n==1)
+	break;
+	}
+	}
+	change_waveform_mode(&ctrl->panel_data,wf_mode);
+}
+//change_waveform_mode(g_pdata,wf_mode);
+//change_waveform_mode(&ctrl->panel_data,3);
+#endif
+mdss_spi_tx_parameter(parm17,sizeof(parm17));
+
+mdss_spi_tx_parameter(parm21,sizeof(parm21));
+
+//[4101][Raymond] Fix LCM abnormal issue - begin
+mdss_spi_tx_parameter(parm_dtm2,sizeof(parm_dtm2)); //DTM2 black
+//[4101][Raymond] Fix LCM abnormal issue - end
+mdss_spi_tx_parameter(parm23,sizeof(parm23));
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+//pr_err("pon busy_n status:%d \n", busy_n);
+if(busy_n==1)
+	break;
+}
+mdss_spi_tx_parameter(parm24,sizeof(parm24)); //PON
+//mdss_spi_tx_parameter(parm25,sizeof(parm25)); //DRF
+//mdelay(1000);
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+//pr_err("pon busy_n status:%d \n", busy_n);
+if(busy_n==1)
+	break;
+}
+#endif
+
+//[4101][Raymond] impelment uevent feature - begin
+if(os_mode==1 && gdev_done==1){
+	kobject_uevent_env(&g_dev->kobj,
+		KOBJ_CHANGE, power1); // send uevent busy=0
+	pr_err("%s send power state =1 uevent \n",__func__);
+}
+//[4101][Raymond] impelment uevent feature - end
+
+
+//[4101][Raymond]off charging icon - begin
+if(chg_mode==1){ // off charging mode
+  if( chg_mode_show==1){
+		//<2019/02/23, Yuchen-[4101] use macro to insert pixel
+		if(color_id==2){ //white phone
+			memset(EPD_Macro_Insert_4bit,0xFF,144002);
+			xor_chr=0x00;
+		}else{//black phone
+			memset(EPD_Macro_Insert_4bit,0x00,144002);
+			xor_chr=0xff;//inverse
+		}
+		EPD_Macro_Insert_4bit[0] = 0x10;
+		EPD_Macro_Insert_4bit[1] = 0x03;
+		h_space=136;//initial position
+		w_space=146;//initial position
+		//[4101][Raymond]picture of the battery full for off-charging -begin
+		if(battery_full==1){ //full chg
+              Insert_pixel(xor_chr,white_full_chg,full_chg_WIDTH,full_chg_HEIGHT,h_space,w_space);
+			}
+		else{
+		Insert_pixel(xor_chr,white_offchg_rgb,offchg_WIDTH,offchg_HEIGHT,h_space,w_space);
+			}
+		//[4101][Raymond]picture of the battery full for off-charging -end
+		//>2019/02/23, Yuchen
+	mdss_spi_tx_parameter(EPD_Macro_Insert_4bit,TOTAL_PIXEL_ARY_CNT+2);//2019/02/23,Yuchen
+	mdss_spi_tx_parameter(parm_b5,sizeof(parm_b5));
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+if(busy_n==1)
+	break;
+}
+chg_mode_show=0;
+  	}
+
+show_count=show_count+1;
+
+}
+//[4101][Raymond]off charging icon - end
 	pinfo->blank_state = MDSS_PANEL_BLANK_UNBLANK;
 
-	pr_debug("%s:-\n", __func__);
-
+#if 1
+	pr_err("%s --\n",__func__);
+#endif
 	return 0;
 }
 
@@ -522,8 +2235,27 @@ static int mdss_spi_panel_off(struct mdss_panel_data *pdata)
 {
 	struct spi_panel_data *ctrl = NULL;
 	struct mdss_panel_info *pinfo;
-	int i;
+	//int i;
+	//int ret=0;
+	int busy_n;
+	//int rc = 0;
+//[4101][Raymond]Fix screen abnormal in suspend - begin	
+if(os_mode==1){
+	bflash=0;
+}
+panel_suspend=1;
+//[4101][Raymond]Fix screen abnormal in suspend - end
+memset(EPD_fb_4bit,0xFF,144002); //
+	parm_b2[0] = 0x10;
+	parm_b2[1] = 0x03;
+	EPD_fb_4bit[0] = 0x10;
+	EPD_fb_4bit[1] = 0x03;
 
+#if 1
+	pr_err("%s ++\n",__func__);
+#endif
+
+	bRemoteContentInconsistant = true;
 	if (pdata == NULL) {
 		pr_err("%s: Invalid input data\n", __func__);
 		return -EINVAL;
@@ -532,31 +2264,156 @@ static int mdss_spi_panel_off(struct mdss_panel_data *pdata)
 	pinfo = &pdata->panel_info;
 	ctrl = container_of(pdata, struct spi_panel_data,
 				panel_data);
+//[4101][Raymond]three seconds Power Off command Implementation - begin
+//pr_err("%s cancel_delayed_work_sync \n",__func__);
+cancel_delayed_work_sync(&epd_pof_work);
+//[4101][Raymond]three seconds Power Off command Implementation - end
+if(chg_mode==0){ //normal boot
+//[4101][Raymond]fix JIRA PRJ4101-17- begin
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+if(busy_n==1)
+	break;
+}
+//[4101][Raymond]Fix JIRA PRJ4101-17- end
+mdss_spi_tx_parameter(PON_REG,sizeof(PON_REG)); //PON
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+if(busy_n==1)
+	break;
+}
+//mdss_spi_tx_parameter(parm_b1,sizeof(parm_b1));
+//<2018/10/09,Yuchen-[4101] handle power off case
 
-	for (i = 0; i < ctrl->off_cmds.cmd_cnt; i++) {
-		/* pull down dc gpio indicate this is command */
-		gpio_direction_output(ctrl->disp_dc_gpio, 0);
-		mdss_spi_tx_command(ctrl->off_cmds.cmds[i].command);
-		gpio_direction_output((ctrl->disp_dc_gpio), 1);
+//#if DYN_PARTIAL_UPDATE
+has_pre_frame=false;
+//#endif
 
-		if (ctrl->off_cmds.cmds[i].dchdr.dlen > 1) {
-			mdss_spi_tx_parameter(ctrl->off_cmds.cmds[i].parameter,
-					ctrl->off_cmds.cmds[i].dchdr.dlen-1);
-		}
-
-		if (ctrl->off_cmds.cmds[i].dchdr.wait != 0)
-			msleep(ctrl->off_cmds.cmds[i].dchdr.wait);
+//>2018/10/09,Yuchen
+//[4101][Raymond] improve ghost image when system suspend - begin
+if(!rcy_mode){//2019/03/20,Yuchen
+change_waveform_mode(&ctrl->panel_data,4);
+mdss_spi_tx_parameter(parm_dtmw_full,sizeof(parm_dtmw_full)); //DTMW
+mdss_spi_tx_parameter(EPD_fb_4bit,sizeof(EPD_fb_4bit));//white
+//[4101][Raymond] impelment uevent feature - begin
+if(os_mode==1 && gdev_done==1){
+	kobject_uevent_env(&g_dev->kobj,
+		KOBJ_CHANGE, envp2); // send uevent busy=1
+	pr_err("%s send epd busy=1 uevent \n",__func__);
+}
+//[4101][Raymond] impelment uevent feature - end
+mdss_spi_tx_parameter(parm25,sizeof(parm25)); //DRF
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+if(busy_n==1)
+	break;
+}
+}//2019/03/20,Yuchen
+//[Arima][Raymond]color of screen to match color id in suspend -begin
+if(color_id!=2){ //!=white
+	mdss_spi_tx_parameter(parm_dtmw_full,sizeof(parm_dtmw_full)); //DTMW
+	mdss_spi_tx_parameter(parm_b2,sizeof(parm_b2));//black
+	mdss_spi_tx_parameter(parm25,sizeof(parm25)); //DRF
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	if(busy_n==1)
+		break;
 	}
+}
+else{ //white
+		mdss_spi_tx_parameter(parm_dtmw_full,sizeof(parm_dtmw_full)); //DTMW
+		mdss_spi_tx_parameter(EPD_fb_4bit,sizeof(EPD_fb_4bit));//white
+		mdss_spi_tx_parameter(parm25,sizeof(parm25)); //DRF
+		while(1){
+		busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+		if(busy_n==1)
+		break;
+		}
+	}
+//[Arima][Raymond]color of screen to match color id in suspend -end	
+//[4101][Raymond] improve ghost image when system suspend - end
+//[4101][Raymond] impelment uevent feature - begin
+if(os_mode==1 && gdev_done==1){
+	kobject_uevent_env(&g_dev->kobj,
+		KOBJ_CHANGE, envp); // send uevent busy=0
+	pr_err("%s[Raymond] send epd busy=0 uevent \n",__func__);
+	kobject_uevent_env(&g_dev->kobj,
+		KOBJ_CHANGE, power0); // send uevent busy=0
+	pr_err("%s[Raymond] send power state =0 uevent \n",__func__);
+}
+//[4101][Raymond] impelment uevent feature - end
+mdss_spi_tx_parameter(parm26,sizeof(parm26)); //POF
+while(1){
+busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+//pr_err("pon busy_n status:%d \n", busy_n);
+if(busy_n==1)
+	break;
+}
 
 	pinfo->blank_state = MDSS_PANEL_BLANK_BLANK;
 
-	pr_debug("%s:-\n", __func__);
+}else{ //off charging mode
+if(show_count>=3){
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	if(busy_n==1)
+		break;
+	}
+	mdss_spi_tx_parameter(PON_REG,sizeof(PON_REG)); //PON
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	if(busy_n==1)
+		break;
+	}
+//[4101][Raymond] improve ghost image when system suspend - begin
+	change_waveform_mode(&ctrl->panel_data,4);
+	mdss_spi_tx_parameter(EPD_fb_4bit,sizeof(EPD_fb_4bit));//white
+	mdss_spi_tx_parameter(parm25,sizeof(parm25)); //DRF
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	if(busy_n==1)
+		break;
+	}
+//[Arima][Raymond]color of screen to match color id in offcharging -begin	
+	if(color_id!=2){ //!=white
+		mdss_spi_tx_parameter(parm_b2,sizeof(parm_b2));//black
+		mdss_spi_tx_parameter(parm25,sizeof(parm25)); //DRF
+		while(1){
+		busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+		if(busy_n==1)
+		break;
+		}
+	}
+	else{ //white
+		mdss_spi_tx_parameter(EPD_fb_4bit,sizeof(EPD_fb_4bit));//white
+		mdss_spi_tx_parameter(parm25,sizeof(parm25)); //DRF
+		while(1){
+		busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+		if(busy_n==1)
+		break;
+		}
+	}
+//[Arima][Raymond]color of screen to match color id in offcharging -end	
+//[4101][Raymond] improve ghost image when system suspend - end
+	mdss_spi_tx_parameter(parm26,sizeof(parm26)); //POF
+	while(1){
+	busy_n=check_busy_n_status(ctrl->disp_busy_gpio);
+	if(busy_n==1)
+	break;
+	}
+	chg_mode_show=1;
+}
+}
+
+	pr_err("%s --\n",__func__);
+
 	return 0;
 }
 
 static void mdss_spi_put_dt_vreg_data(struct device *dev,
 	struct dss_module_power *module_power)
 {
+
 	if (!module_power) {
 		pr_err("%s: invalid input\n", __func__);
 		return;
@@ -567,6 +2424,7 @@ static void mdss_spi_put_dt_vreg_data(struct device *dev,
 		module_power->vreg_config = NULL;
 	}
 	module_power->num_vreg = 0;
+
 }
 
 
@@ -704,6 +2562,7 @@ static int mdss_spi_get_panel_vreg_data(struct device *dev,
 			++i;
 		}
 	}
+
 	return rc;
 error:
 	kfree(mp->vreg_config);
@@ -818,6 +2677,7 @@ static int mdss_spi_panel_parse_reset_seq(struct device_node *np,
 			*rst_len = num;
 		}
 	}
+
 	return 0;
 }
 
@@ -880,9 +2740,12 @@ static void mdss_spi_parse_esd_params(struct device_node *np,
 	pinfo->esd_check_enabled = of_property_read_bool(np,
 		"qcom,esd-check-enabled");
 
-	if (!pinfo->esd_check_enabled)
+	if (!pinfo->esd_check_enabled){
+		ctrl->act_status_value = kzalloc(sizeof(u8) *
+				(1 + 1), GFP_KERNEL);
+		pr_err("%s esd_check_enabled nor enable \n",__func__);
 		return;
-
+		}
 	ctrl->status_mode = SPI_ESD_MAX;
 
 	rc = of_property_read_string(np,
@@ -1115,7 +2978,16 @@ static void mdss_spi_panel_bklt_pwm(struct spi_panel_data *ctrl, int level)
 		pr_err("%s: no PWM\n", __func__);
 		return;
 	}
-
+//[4101][Raymond]Modify front light brightness begin
+if(level>10)
+{
+level=10;
+}
+if(level==1)
+{
+level=0;
+}
+//[4101][Raymond]Modify front light brightness end
 	if (level == 0) {
 		if (ctrl->pwm_enabled) {
 			ret = pwm_config_us(ctrl->pwm_bl, level,
@@ -1132,9 +3004,9 @@ static void mdss_spi_panel_bklt_pwm(struct spi_panel_data *ctrl, int level)
 	duty = level * ctrl->pwm_period;
 	duty /= ctrl->bklt_max;
 
-	pr_debug("%s: bklt_ctrl=%d pwm_period=%d pwm_gpio=%d pwm_lpg_chan=%d\n",
+	pr_err("%s: bklt_ctrl=%d pwm_period=%d pwm_gpio=%d pwm_lpg_chan=%d duty=%d level=%d \n",
 			__func__, ctrl->bklt_ctrl, ctrl->pwm_period,
-				ctrl->pwm_pmic_gpio, ctrl->pwm_lpg_chan);
+				ctrl->pwm_pmic_gpio, ctrl->pwm_lpg_chan,duty,level);
 
 	if (ctrl->pwm_period >= USEC_PER_SEC) {
 		ret = pwm_config_us(ctrl->pwm_bl, duty, ctrl->pwm_period);
@@ -1311,7 +3183,7 @@ static int mdss_spi_panel_regulator_init(struct platform_device *pdev)
 	return rc;
 
 }
-
+#if 0
 static irqreturn_t spi_panel_te_handler(int irq, void *data)
 {
 	struct spi_panel_data *ctrl_pdata = (struct spi_panel_data *)data;
@@ -1330,7 +3202,7 @@ static irqreturn_t spi_panel_te_handler(int irq, void *data)
 
 	return IRQ_HANDLED;
 }
-
+#endif
 void mdp3_spi_vsync_enable(struct mdss_panel_data *pdata,
 				struct mdp3_notification *vsync_client)
 {
@@ -1421,6 +3293,13 @@ static int spi_panel_device_register(struct device_node *pan_node,
 	if (!gpio_is_valid(ctrl_pdata->disp_te_gpio))
 		pr_err("%s:%d, TE gpio not specified\n",
 						__func__, __LINE__);
+//raymond test b
+	ctrl_pdata->disp_busy_gpio = of_get_named_gpio(ctrl_pdev->dev.of_node,
+		"qcom,platform-busy-gpio", 0);
+	if (!gpio_is_valid(ctrl_pdata->disp_busy_gpio))
+		pr_err("%s:%d, busy gpio not specified\n",
+						__func__, __LINE__);
+//raymond test e
 
 	ctrl_pdata->disp_dc_gpio = of_get_named_gpio(ctrl_pdev->dev.of_node,
 		"qcom,platform-spi-dc-gpio", 0);
@@ -1434,6 +3313,26 @@ static int spi_panel_device_register(struct device_node *pan_node,
 		pr_err("%s:%d, reset gpio not specified\n",
 						__func__, __LINE__);
 
+	//raymond test b
+ctrl_pdata->vcc_en_gpio = of_get_named_gpio(ctrl_pdev->dev.of_node,
+			 "qcom,platform-vcc-en-gpio", 0);
+	if (!gpio_is_valid(ctrl_pdata->vcc_en_gpio))
+		pr_err("%s:%d, vcc en gpio not specified\n",
+						__func__, __LINE__);
+//[4101][Raymond] decrease power consumption in suspend - begin
+	ctrl_pdata->ls_en_gpio = of_get_named_gpio(ctrl_pdev->dev.of_node,
+			 "qcom,platform-ls-en-gpio", 0);
+	if (!gpio_is_valid(ctrl_pdata->ls_en_gpio))
+		pr_err("%s:%d, ls en gpio not specified\n",
+						__func__, __LINE__);
+
+	ctrl_pdata->boost_en_gpio = of_get_named_gpio(ctrl_pdev->dev.of_node,
+			 "qcom,platform-boost-en-gpio", 0);
+	if (!gpio_is_valid(ctrl_pdata->boost_en_gpio))
+		pr_err("%s:%d, boost en gpio not specified\n",
+						__func__, __LINE__);
+	//raymond test e
+//[4101][Raymond] decrease power consumption in suspend - end
 	ctrl_pdata->panel_data.event_handler = mdss_spi_panel_event_handler;
 
 	if (ctrl_pdata->bklt_ctrl == SPI_BL_PWM)
@@ -1545,6 +3444,892 @@ end:
 	return spi_pan_node;
 }
 
+//[4101][LCM][RaymondLin] Add LCM_vendor file node for PCBA function test begin
+extern int seq_printf(struct seq_file *m, const char *f, ...);
+extern int single_open(struct file *, int (*)(struct seq_file *, void *), void *);
+extern ssize_t seq_read(struct file *, char __user *, size_t, loff_t *);
+extern loff_t seq_lseek(struct file *, loff_t, int);
+extern int single_release(struct inode *, struct file *);
+static int proc_lcm_vendor_show(struct seq_file *m, void *v)
+{
+    int lcm_id=1;
+    //int LCM_ID_PIN=80;
+    //lcm_id = mt_get_gpio_in(GPIO_LCM_ID_PIN);
+
+    if(lcm_id == 1)
+    {
+    	seq_printf(m, "E-ink EPD");
+    }
+    else
+    {
+    	seq_printf(m, "EPD");
+    }
+
+    return 0;
+}
+static int proc_lcm_vendor_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, proc_lcm_vendor_show, NULL);
+}
+
+static const struct file_operations proc_lcm_vendor_fops = {
+    .open  = proc_lcm_vendor_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+//[4101][LCM][RaymondLin] Add LCM_vendor file node for PCBA function test end
+
+static int proc_epd_wf_show(struct seq_file *m, void *v)
+{
+pr_err("%s ++\n",__func__);
+    	//seq_printf(m, "GL16");
+seq_printf(m, "%d",wf_mode);
+pr_err("%s --\n",__func__);
+    return 0;
+}
+
+static ssize_t proc_epd_wf_write(struct file *file, const char __user *buffer,
+				    size_t count, loff_t *pos)
+{
+	char mode[]="0x00000000";
+
+	u8 input_value;
+
+pr_err("%s ++\n",__func__);
+
+	if (copy_from_user(mode, buffer, sizeof(mode))) return count;
+
+      if (sscanf(mode, "%hhu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	#if 1
+	if(input_value ==0){
+            	pr_err("[R]%s mode=0 \n",__func__);
+		change_waveform_mode(g_pdata,0);
+		}
+	else if(input_value ==1){
+ 		pr_err("[R]%s mode=1 \n",__func__);
+		change_waveform_mode(g_pdata,1);
+		}
+	else if(input_value ==2){
+		pr_err("[R]%s mode=2 \n",__func__);
+		change_waveform_mode(g_pdata,2);
+		}
+	else if(input_value ==3){
+		pr_err("[R]%s mode=3 \n",__func__);
+		change_waveform_mode(g_pdata,3);
+		}
+	else if(input_value ==4){
+		pr_err("[R]%s mode=4 \n",__func__);
+		change_waveform_mode(g_pdata,4);
+		}
+	else{
+		input_value =3;
+		change_waveform_mode(g_pdata,3);
+		pr_err("[R]%s default mode=3 \n",__func__);
+		}
+	#endif
+	wf_mode = input_value;
+
+pr_err("%s, mode=%s ,input_value=%d --\n",__func__,mode,input_value);
+	return count;
+	//return 0;
+}
+
+static int proc_epd_wf_open(struct inode *inode, struct file *file)
+{
+pr_err("%s ++\n",__func__);
+    return single_open(file, proc_epd_wf_show, NULL);
+pr_err("%s --\n",__func__);
+}
+
+static const struct file_operations proc_epd_wf_fops = {
+    .open  = proc_epd_wf_open,
+    .llseek = seq_lseek,
+    .release = single_release,
+    .write = proc_epd_wf_write,
+    .read = seq_read,
+};
+
+static int proc_epd_pu_en_show(struct seq_file *m, void *v)
+{
+pr_err("%s ++\n",__func__);
+    	//seq_printf(m, "GL16");
+seq_printf(m, "%d",pu_en);
+pr_err("%s --\n",__func__);
+    return 0;
+}
+
+static ssize_t proc_epd_pu_en_write(struct file *file, const char __user *buffer,
+				    size_t count, loff_t *pos)
+{
+	char mode[]="0x00000000";
+
+	u8 input_value;
+	//u16 input_value;
+
+pr_err("%s ++\n",__func__);
+
+	if (copy_from_user(mode, buffer, sizeof(mode))) return count;
+
+      if (sscanf(mode, "%hhu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	pu_en = input_value;
+	if(pu_en==1){
+		drx_x3 = (pu_x / 256) ;
+		drx_x4 = (pu_x % 256) ;
+		drx_y5 = (pu_y / 256) ;
+		drx_y6 = (pu_y % 256) ;
+		drx_w7 = (pu_w / 256) ;
+		drx_w8 = (pu_w % 256) ;
+		drx_l9 = (pu_l / 256) ;
+		drx_l10 = (pu_l % 256) ;
+
+		}
+	else{ //not enable
+       	drx_x3=0x00;
+		drx_x4=0x00;
+		drx_y5=0x00;
+		drx_y6=0x00;
+		drx_w7=0x02;
+		drx_w8=0x58;
+		drx_l9=0x01;
+		drx_l10=0xE0;
+		}
+
+pr_err("%s, mode=%s ,input_value=%d --\n",__func__,mode,input_value);
+	return count;
+	//return 0;
+}
+
+
+static int proc_epd_pu_en_open(struct inode *inode, struct file *file)
+{
+pr_err("%s ++\n",__func__);
+    return single_open(file, proc_epd_pu_en_show, NULL);
+pr_err("%s --\n",__func__);
+}
+
+static const struct file_operations proc_epd_pu_en_fops = {
+    .open  = proc_epd_pu_en_open,
+    .llseek = seq_lseek,
+    .release = single_release,
+    .write = proc_epd_pu_en_write,
+    .read = seq_read,
+};
+
+static int proc_epd_pu_x_show(struct seq_file *m, void *v)
+{
+pr_err("%s ++\n",__func__);
+    	//seq_printf(m, "GL16");
+seq_printf(m, "%d",pu_x);
+pr_err("%s --\n",__func__);
+    return 0;
+}
+
+static ssize_t proc_epd_pu_x_write(struct file *file, const char __user *buffer,
+				    size_t count, loff_t *pos)
+{
+	char mode[]="0x00000000";
+
+	u16 input_value;
+
+pr_err("%s ++\n",__func__);
+
+	if (copy_from_user(mode, buffer, sizeof(mode))) return count;
+
+      if (sscanf(mode, "%hu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	pu_x = input_value;
+
+pr_err("%s, mode=%s ,input_value=%d --\n",__func__,mode,input_value);
+	return count;
+	//return 0;
+}
+
+
+static int proc_epd_pu_x_open(struct inode *inode, struct file *file)
+{
+pr_err("%s ++\n",__func__);
+    return single_open(file, proc_epd_pu_x_show, NULL);
+pr_err("%s --\n",__func__);
+}
+
+static const struct file_operations proc_epd_pu_x_fops = {
+    .open  = proc_epd_pu_x_open,
+    .llseek = seq_lseek,
+    .release = single_release,
+    .write = proc_epd_pu_x_write,
+    .read = seq_read,
+};
+
+static int proc_epd_pu_y_show(struct seq_file *m, void *v)
+{
+pr_err("%s ++\n",__func__);
+    	//seq_printf(m, "GL16");
+seq_printf(m, "%d",pu_y);
+pr_err("%s --\n",__func__);
+    return 0;
+}
+
+static ssize_t proc_epd_pu_y_write(struct file *file, const char __user *buffer,
+				    size_t count, loff_t *pos)
+{
+	char mode[]="0x00000000";
+
+	u16 input_value;
+
+pr_err("%s ++\n",__func__);
+
+	if (copy_from_user(mode, buffer, sizeof(mode))) return count;
+
+      if (sscanf(mode, "%hu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	pu_y = input_value;
+
+pr_err("%s, mode=%s ,input_value=%d --\n",__func__,mode,input_value);
+	return count;
+	//return 0;
+}
+
+
+static int proc_epd_pu_y_open(struct inode *inode, struct file *file)
+{
+pr_err("%s ++\n",__func__);
+    return single_open(file, proc_epd_pu_y_show, NULL);
+pr_err("%s --\n",__func__);
+}
+
+static const struct file_operations proc_epd_pu_y_fops = {
+    .open  = proc_epd_pu_y_open,
+    .llseek = seq_lseek,
+    .release = single_release,
+    .write = proc_epd_pu_y_write,
+    .read = seq_read,
+};
+
+static int proc_epd_pu_w_show(struct seq_file *m, void *v)
+{
+pr_err("%s ++\n",__func__);
+    	//seq_printf(m, "GL16");
+seq_printf(m, "%d",pu_w);
+pr_err("%s --\n",__func__);
+    return 0;
+}
+
+static ssize_t proc_epd_pu_w_write(struct file *file, const char __user *buffer,
+				    size_t count, loff_t *pos)
+{
+	char mode[]="0x00000000";
+
+	u16 input_value;
+
+pr_err("%s ++\n",__func__);
+
+	if (copy_from_user(mode, buffer, sizeof(mode))) return count;
+
+      if (sscanf(mode, "%hu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	pu_w = input_value;
+
+pr_err("%s, mode=%s ,input_value=%d --\n",__func__,mode,input_value);
+	return count;
+	//return 0;
+}
+
+static int proc_epd_pu_w_open(struct inode *inode, struct file *file)
+{
+pr_err("%s ++\n",__func__);
+    return single_open(file, proc_epd_pu_w_show, NULL);
+pr_err("%s --\n",__func__);
+}
+
+static const struct file_operations proc_epd_pu_w_fops = {
+    .open  = proc_epd_pu_w_open,
+    .llseek = seq_lseek,
+    .release = single_release,
+    .write = proc_epd_pu_w_write,
+    .read = seq_read,
+};
+
+static int proc_epd_pu_l_show(struct seq_file *m, void *v)
+{
+pr_err("%s ++\n",__func__);
+    	//seq_printf(m, "GL16");
+seq_printf(m, "%d",pu_l);
+pr_err("%s --\n",__func__);
+    return 0;
+}
+
+static ssize_t proc_epd_pu_l_write(struct file *file, const char __user *buffer,
+				    size_t count, loff_t *pos)
+{
+	char mode[]="0x00000000";
+
+	u16 input_value;
+
+pr_err("%s ++\n",__func__);
+
+	if (copy_from_user(mode, buffer, sizeof(mode))) return count;
+
+      if (sscanf(mode, "%hu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	pu_l = input_value;
+
+pr_err("%s, mode=%s ,input_value=%d --\n",__func__,mode,input_value);
+	return count;
+	//return 0;
+}
+
+static int proc_epd_pu_l_open(struct inode *inode, struct file *file)
+{
+pr_err("%s ++\n",__func__);
+    return single_open(file, proc_epd_pu_l_show, NULL);
+pr_err("%s --\n",__func__);
+}
+
+static const struct file_operations proc_epd_pu_l_fops = {
+    .open  = proc_epd_pu_l_open,
+    .llseek = seq_lseek,
+    .release = single_release,
+    .write = proc_epd_pu_l_write,
+    .read = seq_read,
+};
+
+static ssize_t epd_wf_mode_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+
+	u8 input_value;
+	pr_err("%s ++\n",__func__);
+
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hhu", &input_value) != 1) {
+		return -EINVAL;
+	}
+
+	 if(input_value ==0){
+            	pr_err("[R]%s mode=0 \n",__func__);
+			if(input_value==wf_mode){
+				pr_err("[R]%s waveform mode already is 0 \n",__func__);
+				}
+			else{
+				wf_mode = input_value;
+				change_waveform_mode(g_pdata,0);
+				}
+		}
+	else if(input_value ==1){
+            	pr_err("[R]%s mode=1 \n",__func__);
+			if(input_value==wf_mode){
+				pr_err("[R]%s waveform mode already is 1 \n",__func__);
+				}
+			else{
+				wf_mode = input_value;
+				change_waveform_mode(g_pdata,1);
+				}
+		}
+	else if(input_value ==2){
+            	pr_err("[R]%s mode=2 \n",__func__);
+			if(input_value==wf_mode){
+				pr_err("[R]%s waveform mode already is 2 \n",__func__);
+				}
+			else{
+				wf_mode = input_value;
+				change_waveform_mode(g_pdata,2);
+				}
+		}
+	else if(input_value ==3){
+            	pr_err("[R]%s mode=3 \n",__func__);
+			if(input_value==wf_mode){
+				pr_err("[R]%s waveform mode already is 3 \n",__func__);
+				}
+			else{
+				wf_mode = input_value;
+				change_waveform_mode(g_pdata,3);
+				}
+		}
+	else if(input_value ==4){
+            	pr_err("[R]%s mode=4 \n",__func__);
+			if(input_value==wf_mode){
+				pr_err("[R]%s waveform mode already is 4 \n",__func__);
+				}
+			else{
+				wf_mode = input_value;
+				change_waveform_mode(g_pdata,4);
+				}
+		}
+	else{
+		input_value =3;
+		pr_err("[R]%s default mode=3 \n",__func__);
+		wf_mode = input_value;
+		change_waveform_mode(g_pdata,3);
+		}
+
+pr_err("%s --\n",__func__);
+	return count;
+}
+
+
+static ssize_t epd_get_wf_mode(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "wf_mode=%d \n",wf_mode);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+static ssize_t epd_pu_en_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+
+	u8 input_value;
+	pr_err("%s ++\n",__func__);
+
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hhu", &input_value) != 1) {
+		return -EINVAL;
+	}
+
+	 pu_en = input_value;
+	if(pu_en==1){
+		pu_rx=pu_x;
+		pu_ry=pu_y;
+		DYN_PARTIAL_UPDATE=0;
+		pu_ry=479-(pu_w+pu_x);
+		pu_rx=599-(pu_l+pu_y);
+		if(pu_ry<0)
+			pu_ry=0;
+		if(pu_ry>1023)
+			pu_ry=1023;
+		if(pu_rx<0)
+			pu_rx=0;
+		if(pu_rx>1023)
+			pu_rx=1023;
+		drx_x3 = (pu_rx / 256) ;
+		drx_x4 = (pu_rx % 256) ;
+		drx_y5 = (pu_ry / 256) ;
+		drx_y6 = (pu_ry % 256) ;
+		drx_w7 = (pu_l / 256) ;
+		drx_w8 = (pu_l % 256) ;
+		drx_l9 = (pu_w / 256) ;
+		drx_l10 = (pu_w % 256) ;
+		//[4101]Dynamic partial update begin
+		parm_b5[2]=drx_x3;
+		parm_b5[3]=drx_x4;
+		parm_b5[4]=drx_y5;
+		parm_b5[5]=drx_y6;
+		parm_b5[6]=drx_w7;
+		parm_b5[7]=drx_w8;
+		parm_b5[8]=drx_l9;
+		parm_b5[9]=drx_l10;
+		parm_dtmw_partial[1]=drx_x3;
+		parm_dtmw_partial[2]=drx_x4;
+		parm_dtmw_partial[3]=drx_y5;
+		parm_dtmw_partial[4]=drx_y6;
+		parm_dtmw_partial[5]=drx_w7;
+		parm_dtmw_partial[6]=drx_w8;
+		parm_dtmw_partial[7]=drx_l9;
+		parm_dtmw_partial[8]=drx_l10;
+		//[1401]Dynamic partial update end
+		
+		}
+	else{ //not enable
+		//DYN_PARTIAL_UPDATE=1;
+		has_pre_frame=false;
+       	drx_x3=0x00;
+		drx_x4=0x00;
+		drx_y5=0x00;
+		drx_y6=0x00;
+		drx_w7=0x02;
+		drx_w8=0x58;
+		drx_l9=0x01;
+		drx_l10=0xE0;
+		//[4101]Dynamic partial update begin
+		parm_b5[2]=drx_x3;
+		parm_b5[3]=drx_x4;
+		parm_b5[4]=drx_y5;
+		parm_b5[5]=drx_y6;
+		parm_b5[6]=drx_w7;
+		parm_b5[7]=drx_w8;
+		parm_b5[8]=drx_l9;
+		parm_b5[9]=drx_l10;
+		parm_dtmw_partial[1]=drx_x3;
+		parm_dtmw_partial[2]=drx_x4;
+		parm_dtmw_partial[3]=drx_y5;
+		parm_dtmw_partial[4]=drx_y6;
+		parm_dtmw_partial[5]=drx_w7;
+		parm_dtmw_partial[6]=drx_w8;
+		parm_dtmw_partial[7]=drx_l9;
+		parm_dtmw_partial[8]=drx_l10;
+		//[1401]Dynamic partial update end
+		}
+
+pr_err("%s partial_update_en=%d --\n",__func__,input_value);
+
+	return count;
+}
+
+static ssize_t epd_get_pu_en(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "partial_update_en=%d \n",pu_en);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+static ssize_t epd_pu_x_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+
+	u16 input_value;
+	pr_err("%s ++\n",__func__);
+
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hu", &input_value) != 1) {
+		return -EINVAL;
+	}
+
+	 if(input_value>479)
+		input_value=479;
+	//input_value=479 -input_value;
+	pu_x = input_value;
+
+pr_err("%s partial_update_x=%d --\n",__func__,input_value);
+
+	return count;
+}
+
+static ssize_t epd_get_pu_x(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "partial_update_x=%d \n",pu_x);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+static ssize_t epd_pu_y_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+
+	u16 input_value;
+	int remainder;
+	pr_err("%s ++\n",__func__);
+
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	//[4101][Raymond] Fixed jira PRJ4101-292 - begin
+	remainder = input_value%4;
+	if(remainder!=0)
+		input_value = input_value -(4-remainder);
+	
+	//[4101][Raymond] Fixed jira PRJ4101-292 - end	 
+	
+	 if(input_value>599)
+		input_value=599;
+	//input_value=599 -input_value;
+	pu_y = input_value;
+
+pr_err("%s partial_update_y=%d --\n",__func__,input_value);
+
+	return count;
+}
+
+static ssize_t epd_get_pu_y(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "partial_update_y=%d \n",pu_y);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+static ssize_t epd_pu_w_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+
+	u16 input_value;
+	pr_err("%s ++\n",__func__);
+
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	 if(input_value>480)
+		input_value=480;
+	//input_value=479 -input_value;
+	pu_w = input_value;
+
+pr_err("%s partial_update_w=%d --\n",__func__,input_value);
+
+	return count;
+}
+
+static ssize_t epd_get_pu_w(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "partial_update_w=%d \n",pu_w);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+static ssize_t epd_pu_l_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+
+	u16 input_value;
+	int remainder;
+	pr_err("%s ++\n",__func__);
+
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	//[4101][Raymond] Fixed jira PRJ4101-292 - begin
+	remainder = input_value%4;
+	if(remainder!=0)
+		input_value = input_value+(4-remainder);
+	
+	//[4101][Raymond] Fixed jira PRJ4101-292 - end	 
+	 if(input_value>600)
+		input_value=600;
+	//input_value=599 -input_value;
+	pu_l = input_value;
+
+pr_err("%s partial_update_L=%d --\n",__func__,input_value);
+
+	return count;
+}
+
+static ssize_t epd_get_pu_l(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "partial_update_L=%d \n",pu_l);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+static ssize_t epd_Bflash_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+
+	u8 input_value;
+	pr_err("%s ++\n",__func__);
+
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hhu", &input_value) != 1) {
+		return -EINVAL;
+	}
+//[4101][Raymond]impelment PRJ4101-128 Bug 2a -begin
+	 //bflash = input_value;
+	if(input_value==1){ //flash image
+		//DYN_PARTIAL_UPDATE=0;
+		bflash=1;
+		done_flash=0;
+		//raymond test image begin
+		update_epd(g_pdata,bflash);
+		//raymond test image end
+		}
+	else if(input_value==2){ //flash image
+		//DYN_PARTIAL_UPDATE=0;
+		bflash=2;
+		done_flash=0;
+		//raymond test image begin
+		update_epd(g_pdata,bflash);
+		//raymond test image end
+		}
+	else if(input_value==3){ //flash image
+		//DYN_PARTIAL_UPDATE=0;
+		bflash=3;
+		done_flash=0;
+		//raymond test image begin
+		update_epd(g_pdata,bflash);
+		//raymond test image end
+		}
+	else{ //not flash image
+		//DYN_PARTIAL_UPDATE=1;
+		//has_pre_frame=false;
+		bflash=0;
+		}
+//[4101][Raymond]impelment PRJ4101-128 Bug 2a -end
+pr_err("%s bflash=%d --\n",__func__,input_value);
+
+	return count;
+}
+
+static ssize_t epd_get_Bflash(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "bflash=%d \n",bflash);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+static ssize_t epd_os_mode_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+
+	u8 input_value;
+	pr_err("%s ++\n",__func__);
+//[4101][Raymond] Implement call back feature - begin	
+	g_dev = dev;
+	gdev_done=1;
+//[4101][Raymond] Implement call back feature - end
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hhu", &input_value) != 1) {
+		return -EINVAL;
+	}
+
+	 os_mode = input_value;
+	if(os_mode==1){ // light phone os
+		DYN_PARTIAL_UPDATE=0;
+		bflash=0;
+		os_mode=1;
+		}
+	else{ //android os
+		DYN_PARTIAL_UPDATE=1;
+		bflash=1;
+		os_mode=0;
+
+		}
+
+pr_err("%s os_mode=%d --\n",__func__,input_value);
+
+	return count;
+}
+
+static ssize_t epd_get_os_mode(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "os_mode=%d \n",os_mode);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+static ssize_t epd_done_flash_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+	return count;
+}
+
+static ssize_t epd_get_done_flash(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "%d\n",done_flash);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+
+//[4101][Raymond]picture of the battery full for off-charging -begin
+static ssize_t epd_battery_full_store(struct device *dev,
+			struct device_attribute *attr,
+			const char *buf, size_t count)
+{
+	u8 input_value;
+	pr_err("%s ++\n",__func__);
+
+//[4101][Raymond] Implement call back feature - begin	
+	g_dev = dev;
+	gdev_done=1;
+//[4101][Raymond] Implement call back feature - end
+	 //sscanf(buf, "%d %d", &data[0], &data[1]);
+	     if (sscanf(buf, "%hhu", &input_value) != 1) {
+		return -EINVAL;
+	}
+	if(input_value==0 ||input_value==1){	 
+	battery_full=input_value;
+		}
+	else{
+ 	pr_err("%s,out of range \n",__func__);
+		}
+	pr_err("%s battery_full=%d --\n",__func__,input_value);	
+	return count;
+}
+
+static ssize_t epd_get_battery_full(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	int ret = 0;
+
+	pr_err("%s ++\n",__func__);
+	ret = snprintf(buf, PAGE_SIZE, "%d\n",battery_full);
+	pr_err("%s -- ret =%d \n",__func__,ret);
+	return ret;
+}
+//[4101][Raymond]picture of the battery full for off-charging -end
+static DEVICE_ATTR(wf_mode, 0664, epd_get_wf_mode, epd_wf_mode_store);
+static DEVICE_ATTR(partial_update_en, 0664, epd_get_pu_en, epd_pu_en_store);
+static DEVICE_ATTR(partial_update_x, 0664, epd_get_pu_x, epd_pu_x_store);
+static DEVICE_ATTR(partial_update_y, 0664, epd_get_pu_y, epd_pu_y_store);
+static DEVICE_ATTR(partial_update_w, 0664, epd_get_pu_w, epd_pu_w_store);
+static DEVICE_ATTR(partial_update_l, 0664, epd_get_pu_l, epd_pu_l_store);
+static DEVICE_ATTR(Bflash, 0664, epd_get_Bflash, epd_Bflash_store);
+static DEVICE_ATTR(os_mode, 0664, epd_get_os_mode, epd_os_mode_store);
+static DEVICE_ATTR(done_flash, 0664, epd_get_done_flash, epd_done_flash_store);
+//[4101][Raymond]picture of the battery full for off-charging -begin
+static DEVICE_ATTR(battery_full, 0664, epd_get_battery_full, epd_battery_full_store);
+//[4101][Raymond]picture of the battery full for off-charging -end
+//static DEVICE_ATTR(strobe, 0664, NULL, led_strobe_type_store);
+
+static struct attribute *epd_attrs[] = {
+	&dev_attr_wf_mode.attr,
+	&dev_attr_partial_update_en.attr,
+	&dev_attr_partial_update_x.attr,
+	&dev_attr_partial_update_y.attr,
+	&dev_attr_partial_update_w.attr,
+	&dev_attr_partial_update_l.attr,
+	&dev_attr_Bflash.attr,
+	&dev_attr_os_mode.attr,
+	&dev_attr_done_flash.attr,
+	&dev_attr_battery_full.attr, //[4101][Raymond]picture of the battery full for off-charging
+	NULL
+};
+
+const struct attribute_group epd_attr_group = {
+	.attrs = epd_attrs,
+};
 
 static int mdss_spi_panel_probe(struct platform_device *pdev)
 {
@@ -1556,7 +4341,13 @@ static int mdss_spi_panel_probe(struct platform_device *pdev)
 	char panel_cfg[MDSS_MAX_PANEL_LEN];
 	struct mdss_util_intf *util;
 	const char *ctrl_name;
+	struct proc_dir_entry *dir, *res;
+	int r=0;
+	signed int irqn;
 
+#if 1
+pr_err("%s ++\n",__func__);
+#endif
 	util = mdss_get_util_intf();
 	if (util == NULL) {
 		pr_err("Failed to get mdss utility functions\n");
@@ -1600,10 +4391,10 @@ static int mdss_spi_panel_probe(struct platform_device *pdev)
 
 	ctrl_name = of_get_property(pdev->dev.of_node, "label", NULL);
 	if (!ctrl_name)
-		pr_info("%s:%d, Ctrl name not specified\n",
+		pr_err("%s:%d, Ctrl name not specified\n",
 			__func__, __LINE__);
 	else
-		pr_debug("%s: Ctrl name = %s\n",
+		pr_err("%s: Ctrl name = %s\n",
 			__func__, ctrl_name);
 
 
@@ -1662,7 +4453,8 @@ static int mdss_spi_panel_probe(struct platform_device *pdev)
 
 	init_completion(&ctrl_pdata->spi_panel_te);
 	mutex_init(&ctrl_pdata->spi_tx_mutex);
-
+	already_probe=true;//2018/10/23,Yuchen
+#if 0
 	rc = devm_request_irq(&pdev->dev,
 		gpio_to_irq(ctrl_pdata->disp_te_gpio),
 		spi_panel_te_handler, IRQF_TRIGGER_RISING,
@@ -1671,10 +4463,166 @@ static int mdss_spi_panel_probe(struct platform_device *pdev)
 		pr_err("TE request_irq failed.\n");
 		return rc;
 	}
+#endif
+#if 1
+	init_waitqueue_head(&ctrl_pdata->busy_wq);
+	rc = gpio_request(ctrl_pdata->disp_busy_gpio, "disp_busy");
+	if (rc) {
+		pr_err("disp_busy: gpio request failed\n");
+		goto error_busy_request;
+	}
 
+	rc = gpio_direction_input(ctrl_pdata->disp_busy_gpio);
+	if (rc < 0) {
+		pr_err("disp_busy: gpio direction_input failed\n");
+		goto error_busy_request;
+	}
+
+	rc =irqn = gpio_to_irq(ctrl_pdata->disp_busy_gpio);
+	if(rc<0){
+		pr_err("disp_busy: gpio to irq failed\n");
+		goto error_busy_request;
+	}
+
+	//r = request_irq(irq, epd_irq_handler,
+			  //IRQF_TRIGGER_HIGH, "EPD", ctrl_pdata);
+	ctrl_pdata->irq_enable = true;		  
+	r=devm_request_irq(&pdev->dev,irqn,epd_irq_handler,IRQF_TRIGGER_RISING,"EPD_IRQ",ctrl_pdata);	  
+	if (r) {
+		pr_err("disp_busy: devm_request_irq fail \n");
+		goto error_busy_request;
+		}
+	
+	disable_irq(irqn);
+	//epd_disable_irq(ctrl_pdata);
+	ctrl_pdata->irq = irqn;
+	ctrl_pdata->irq_enable = false;
+#endif
+//[4101][Raymond]three seconds Power Off command Implementation - begin
+	INIT_DELAYED_WORK(&epd_pof_work, epd_pof_cmd);
+//[4101][Raymond]three seconds Power Off command Implementation - end
+/*[4101][Raymond] implement EPD vcom read write command  begin*/
+	{
+		const char *vcom_buf = NULL;
+		vcom_buf = strstr(saved_command_line, "androidboot.lcm_vcom=");
+		if (vcom_buf) {
+
+			char temp_buf[128]={0};
+
+			 u8 vcom_1;
+			 u8 vcom_2;
+			 int vcom_int;
+			int vcom_int_2;
+
+                     pr_err("%s(%d): vcom_buf = %s \n", __func__, __LINE__,vcom_buf);
+
+			sscanf(vcom_buf, "%s%hhu.%hhu", temp_buf, &vcom_1, &vcom_2);
+			sscanf(vcom_buf, "androidboot.lcm_vcom=-%d.%d", &vcom_int, &vcom_int_2);
+
+			//pr_err("%s(%d): temp_buf=%s  vcom_1=%d, vcom_2=%d \n", __func__, __LINE__, temp_buf,vcom_1,vcom_2);
+			//pr_err("%s(%d): vcom_int=%d, vcom_int_2=%d \n", __func__, __LINE__, vcom_int,vcom_int_2);
+
+                    if(temp_buf[21] == '-'){
+                        pr_err("%s(%d): write vcom, temp_buf[21]=%c \n", __func__, __LINE__,temp_buf[21]);
+			   vcom_value = ((vcom_int*100) + vcom_int_2) /5 ;
+			   para_vcom[1]=vcom_value;
+			   pr_err("%s(%d): vcom=-%d.%d ,para_vcom[0]=0x%X, para_vcom[1]=0x%X \n", __func__, __LINE__, vcom_int,vcom_int_2,para_vcom[0],para_vcom[1]);
+                    	}
+		else{
+                        pr_err("%s(%d): no write vcom, use default vcom \n", __func__, __LINE__);
+			}
+
+		}
+	}
+/*[4101][Raymond] implement EPD vcom read write command  end*/
+//[4101][Raymond]off charging icon - begin
+	{
+		const char *color_id_buf = NULL;
+		color_id_buf = strstr(saved_command_line, "androidboot.color_id=");
+		if (color_id_buf) {
+
+			int color_int;
+			sscanf(color_id_buf, "androidboot.color_id=%d", &color_int);
+			if(color_int==2){ //white
+					pr_err("%s(%d): white color \n", __func__, __LINE__);
+					color_id=2;
+				}
+			else{ //black
+					pr_err("%s(%d): black color \n", __func__, __LINE__);
+					color_id=1;
+				}
+
+
+		}
+		else{
+        			pr_err("%s(%d): black color \n", __func__, __LINE__);
+				color_id=1;
+
+			}
+	}
+
+	{
+		const char *bootmode_buf = NULL;
+		bootmode_buf = strstr(saved_command_line, "androidboot.mode=charger");
+		if (bootmode_buf) {
+
+                     pr_err("%s(%d): off charging mode \n", __func__, __LINE__);
+			chg_mode=1;
+		}
+		else{
+        		pr_err("%s(%d): Normal boot\n", __func__, __LINE__);
+			chg_mode=0;
+			}
+	}
+//[4101][Raymond]off charging icon - end
+	//<2019/02/25,Yuchen-[4101] add for recovery mode
+	{
+		const char *bootmode_recov_buf = NULL;
+		bootmode_recov_buf = strstr(saved_command_line, "androidboot.rcymode");
+		if(bootmode_recov_buf){
+			pr_err("[YC]%s(%d): recovery mode \n", __func__, __LINE__);
+			//2019/03/20,Yuchen erase workaround chg_mode=2;//for recovery only
+			rcy_mode=true;//2019/03/20,Yuchen-[4101]deal with recovery UI issue & disable workaround
+		}
+	}
+	//>2019/02/25,Yuchen
+
+	pr_err("proc_create lcm_vendor \n");
+//[4101][LCM][RaymondLin] Add LCM_vendor file node for PCBA function test begin
+    proc_create("lcm_vendor", 0, NULL, &proc_lcm_vendor_fops);
+//[4101][LCM][RaymondLin] Add LCM_vendor file node for PCBA function test end
+
+	pr_err("proc_create epd/wf_mode \n");
+	dir = proc_mkdir("epd", NULL);
+	if (!dir)
+		return -ENOMEM;
+
+	res = proc_create("epd/wf_mode", 0, NULL, &proc_epd_wf_fops);
+	if (!res)
+		return -ENOMEM;
+	res = proc_create("epd/partial_update_en", S_IWUSR | S_IRUGO, NULL, &proc_epd_pu_en_fops);
+	if (!res)
+		return -ENOMEM;
+	res = proc_create("epd/partial_update_x", S_IWUSR | S_IRUGO, NULL, &proc_epd_pu_x_fops);
+	if (!res)
+		return -ENOMEM;
+	res = proc_create("epd/partial_update_y", S_IWUSR | S_IRUGO, NULL, &proc_epd_pu_y_fops);
+	if (!res)
+		return -ENOMEM;
+	res = proc_create("epd/partial_update_w", S_IWUSR | S_IRUGO, NULL, &proc_epd_pu_w_fops);
+	if (!res)
+		return -ENOMEM;
+	res = proc_create("epd/partial_update_l", S_IWUSR | S_IRUGO, NULL, &proc_epd_pu_l_fops);
+	if (!res)
+		return -ENOMEM;
+#if 1
+pr_err("%s --\n",__func__);
+#endif
 	pr_debug("%s: spi panel  initialized\n", __func__);
 	return 0;
 
+error_busy_request:
+      gpio_free(ctrl_pdata->disp_busy_gpio);
 error_pan_node:
 	of_node_put(spi_pan_node);
 error_vreg:
@@ -1703,8 +4651,13 @@ static struct platform_driver this_driver = {
 static int __init mdss_spi_display_init(void)
 {
 	int ret;
-
+#if 1
+pr_err("%s ++\n",__func__);
+#endif
 	ret = platform_driver_register(&this_driver);
+#if 1
+pr_err("%s --\n",__func__);
+#endif
 	return 0;
 }
 module_init(mdss_spi_display_init);
