@@ -27,6 +27,9 @@
 #include <soc/qcom/scm.h>
 #include <linux/msm_ion.h>
 
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
+
 #include "mdp3_ctrl.h"
 #include "mdp3.h"
 #include "mdp3_ppp.h"
@@ -1520,6 +1523,91 @@ bool is_roi_valid(struct mdp3_dma_source source_config, struct mdp_rect roi)
 		((roi.y + roi.h) <= source_config.height);
 }
 
+static struct hrtimer hr_timer;
+static struct work_struct wq_hrtimer;
+static ktime_t ktime;
+static unsigned int interval=100037; /* unit: us */
+struct timespec uptimeLast;
+struct timespec kickoffLast;
+static bool bInitDone = false;
+static bool bTimerOn = false;
+static bool bKick = false;
+static bool bRecentConsist = false;
+//static struct msm_fb_data_type *mfd_cached = NULL;
+//static struct mdp_display_commit *cmt_data_cached = NULL;
+static struct mdss_panel_data * panel_data_cached = NULL;
+static void * data_addr_cached = NULL;
+static int data_len_cached = 0;
+static int stride_cached = 0;
+extern int os_mode;
+
+unsigned long long diff_tv(struct timespec start, struct timespec end)
+{
+	return (end.tv_sec-start.tv_sec)*1000000000+(end.tv_nsec-start.tv_nsec);
+}
+
+enum hrtimer_restart my_hrtimer_callback( struct hrtimer *timer )
+{
+    schedule_work(&wq_hrtimer);
+    return HRTIMER_NORESTART;
+}
+
+static void wq_func_hrtimer(struct work_struct *work)
+{
+	hr_timer.function = my_hrtimer_callback;
+
+	if(bKick){
+		bKick = false;
+		kickoffLast = uptimeLast;
+		if(!os_mode)mdss_spi_panel_kickoff(panel_data_cached,
+			data_addr_cached, data_len_cached,
+			stride_cached, true);
+		ktime = ktime_set( interval/100/1000000, ((interval/100)%1000000)*1000 );
+		hrtimer_start(&hr_timer, ktime, HRTIMER_MODE_REL );     /* print time every COUNT_INTERVAL*interval second*/
+	} else {
+		struct timespec uptime;
+		unsigned long long llNanosecPast = 0;
+		unsigned long long llNanosecTransition = 0;
+		do_posix_clock_monotonic_gettime(&uptime);
+		llNanosecTransition = diff_tv(kickoffLast, uptime);
+		llNanosecPast = diff_tv(uptimeLast, uptime);
+		if( llNanosecPast < llNanosecTransition ){
+		if(false) {
+					bRecentConsist = true;
+					do_posix_clock_monotonic_gettime(&kickoffLast);
+						ktime = ktime_set( interval/1000000, (interval%1000000)*1000 );
+						hrtimer_start(&hr_timer, ktime, HRTIMER_MODE_REL );     /* print time every COUNT_INTERVAL*interval second*/
+			} else {
+				if( llNanosecTransition>=400000000 || bRecentConsist) {
+					bRecentConsist = false;
+					do_posix_clock_monotonic_gettime(&kickoffLast);
+					if(!os_mode)mdss_spi_panel_kickoff(panel_data_cached,
+						data_addr_cached, data_len_cached,
+						stride_cached, true);
+					ktime = ktime_set( interval/100/1000000, ((interval/100)%1000000)*1000 );
+					hrtimer_start(&hr_timer, ktime, HRTIMER_MODE_REL );     /* print time every COUNT_INTERVAL*interval second*/
+				} else {
+					ktime = ktime_set( interval/1000000, (interval%1000000)*1000 );
+					hrtimer_start(&hr_timer, ktime, HRTIMER_MODE_REL );     /* print time every COUNT_INTERVAL*interval second*/
+				}
+			}
+		} else {
+			if( llNanosecTransition>1000000000 ) {
+				int ret = hrtimer_cancel( &hr_timer );
+				if (ret==0) {
+					bInitDone = false;
+				} else {
+				}
+				bRecentConsist = false;
+				bTimerOn = false;
+			} else {
+				ktime = ktime_set( interval/1000000, (interval%1000000)*1000 );
+				hrtimer_start(&hr_timer, ktime, HRTIMER_MODE_REL );     /* print time every COUNT_INTERVAL*interval second*/
+			}
+		}
+	}
+}
+
 static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 					struct mdp_display_commit *cmt_data)
 {
@@ -1568,6 +1656,11 @@ static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 		}
 		complete_all(&mdp3_session->secure_completion);
 		mdp3_ctrl_notify(mdp3_session, MDP_NOTIFY_FRAME_DONE);
+		if (mdp3_bufq_count(&mdp3_session->bufq_out) > 0) {
+			data = mdp3_bufq_pop(&mdp3_session->bufq_out);
+			if (data)
+				mdp3_put_img(data, MDP3_CLIENT_DMA_P);
+		}
 		mdp3_session->vsync_before_commit = 0;
 		mutex_unlock(&mdp3_session->lock);
 		return 0;
@@ -1619,7 +1712,67 @@ static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 	if (data) {
 		mdp3_ctrl_reset_countdown(mdp3_session, mfd);
 		mdp3_ctrl_clk_enable(mfd, 1);
-		if (mdp3_session->dma->output_config.out_sel ==
+		stride = mdp3_session->dma->source_config.stride;
+                if (mdp3_ctrl_get_intf_type(mfd) ==
+                        MDP3_DMA_OUTPUT_SEL_SPI_CMD){
+                        mdp3_session->intf->active = false;
+                        msm_ion_do_cache_op(mdp3_res->ion_client,
+                                data->srcp_ihdl, (void *)(int)data->addr,
+                                         data->len, ION_IOC_INV_CACHES);
+							if(!os_mode){
+								do_posix_clock_monotonic_gettime(&uptimeLast);
+								if(!bTimerOn) {
+									bTimerOn = true;
+									bKick = true;
+									if(!bInitDone) {
+										hrtimer_init( &hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL );
+										ktime = ktime_set( interval*5/1000000, ((interval*5)%1000000)*1000 );
+										hr_timer.function = my_hrtimer_callback;
+										hrtimer_start( &hr_timer, ktime, HRTIMER_MODE_REL );
+										INIT_WORK(&wq_hrtimer, wq_func_hrtimer);
+										bInitDone = true;
+									} else {
+										ktime = ktime_set( interval*5/1000000, ((interval*5)%1000000)*1000 );
+										hr_timer.function = my_hrtimer_callback;
+										hrtimer_start( &hr_timer, ktime, HRTIMER_MODE_REL );
+									}
+								}
+								{
+									struct spi_panel_data *ctrl_pdata = NULL;
+									char *tx_buf;
+									int panel_xres;
+									int panel_yres;
+									int scan_count = 0;
+									int padding_length = 0;
+									int actual_stride = 0;
+									int byte_per_pixel = 4;
+
+									ctrl_pdata = container_of(mdp3_session->panel, struct spi_panel_data, panel_data);
+									tx_buf = ctrl_pdata->tx_buf;
+									panel_xres = ctrl_pdata->panel_data.panel_info.xres;
+									panel_yres = ctrl_pdata->panel_data.panel_info.yres;
+
+									actual_stride = panel_xres * byte_per_pixel;
+									padding_length = stride - actual_stride;
+
+									while (scan_count < panel_yres) {
+										memcpy((tx_buf + scan_count * actual_stride), ((void *)(int)data->addr + scan_count * (actual_stride + padding_length)), actual_stride);
+										scan_count++;
+									}
+								}
+
+									panel_data_cached = mdp3_session->panel;
+									data_addr_cached = (void *)(int)data->addr;
+									data_len_cached = (int)data->len;
+									stride_cached = stride;
+									rc = 0;
+							} else {
+								rc = mdss_spi_panel_kickoff(mdp3_session->panel,
+										(void *)(int)data->addr, (int)data->len,
+												stride, true);
+							}
+			goto frame_done;
+            } else if (mdp3_session->dma->output_config.out_sel ==
 					MDP3_DMA_OUTPUT_SEL_DSI_CMD) {
 			rc = mdp3_session->dma->wait_for_dma(mdp3_session->dma,
 					mdp3_session->intf);
@@ -1652,6 +1805,7 @@ static int mdp3_ctrl_display_commit_kickoff(struct msm_fb_data_type *mfd,
 			}
 		}
 
+		if(client != MDP3_CLIENT_SPI)
 		rc = mdp3_map_layer(data, MDP3_CLIENT_DMA_P);
 		if (data->len < mdp3_session->dma->source_config.stride *
 				mdp3_session->dma->source_config.height) {
@@ -1790,6 +1944,7 @@ static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd)
 	struct mdss_panel_data *panel;
 
 	int rc;
+	int stride;//2019/03/20,Yuchen-[4101] deal with recovery UI issue
 
 	pr_debug("mdp3_ctrl_pan_display\n");
 	if (!mfd || !mfd->mdp.private1)
@@ -1855,10 +2010,16 @@ static void mdp3_ctrl_pan_display(struct msm_fb_data_type *mfd)
 			}
 		}
 
+		//<2019/03/20,Yuchen-[4101] deal with recovery UI issue
+		if ( (mdp3_ctrl_get_intf_type(mfd) == MDP3_DMA_OUTPUT_SEL_SPI_CMD)) {
+		stride = (fbi->fix.line_length);
+		rc = mdss_spi_panel_kickoff_recovery(mdp3_session->panel,(void *)(int)(mfd->fbi->screen_base + offset),(int)fbi->fix.smem_len, stride,true);
+	  } else {
 		rc = mdp3_session->dma->update(mdp3_session->dma,
 				(void *)(int)(mfd->iova + offset),
 				mdp3_session->intf, NULL,
 				atomic_read(&mdp3_session->secure_display));
+	  }
 		/* This is for the previous frame */
 		if (rc < 0) {
 			mdp3_ctrl_notify(mdp3_session,
