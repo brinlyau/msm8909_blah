@@ -96,8 +96,20 @@ struct spi_panel_data {
 	char *tx_buf;
 	u8 ctrl_state;
 	int disp_te_gpio;
+//[4101][Raymond]Display driver porting - begin	
+	int disp_busy_gpio;
+//[4101][Raymond]Display driver porting - end
 	int rst_gpio;
 	int disp_dc_gpio;	/* command or data */
+	int vcc_en_gpio;
+//[4101][Raymond] decrease power consumption in suspend - begin	
+	int ls_en_gpio;
+	int boost_en_gpio;
+//[4101][Raymond] decrease power consumption in suspend - end	
+	spinlock_t		irq_enabled_lock;
+	bool irq_enable;
+	int irq;
+	wait_queue_head_t	busy_wq;
 	struct spi_panel_cmds on_cmds;
 	struct spi_panel_cmds off_cmds;
 	bool (*check_status)(struct spi_panel_data *pdata);
@@ -118,10 +130,15 @@ struct spi_panel_data {
 	u8 *exp_status_value;
 	u8 *act_status_value;
 	unsigned char *return_buf;
+//[4101][Raymond] Change waveform mode begin
+	struct device *dev;
+//[4101][Raymond] Change waveform mode end
 };
 
 int mdss_spi_panel_kickoff(struct mdss_panel_data *pdata,
-				char *buf, int len, int stride);
+				char *buf, int len, int stride, bool bDelay);
+int mdss_spi_panel_kickoff_recovery(struct mdss_panel_data *pdata,
+				char *buf, int len, int stride, bool bDelay);//2019/03/20,Yuchen-[4101] deal with recovery UI issue
 int is_spi_panel_continuous_splash_on(struct mdss_panel_data *pdata);
 void mdp3_spi_vsync_enable(struct mdss_panel_data *pdata,
 				struct mdp3_notification *vsync_client);
@@ -130,9 +147,15 @@ void mdp3_check_spi_panel_status(struct work_struct *work,
 
 #else
 static inline int mdss_spi_panel_kickoff(struct mdss_panel_data *pdata,
-				char *buf, int len, int stride){
+				char *buf, int len, int stride, bool bDelay){
 	return 0;
 }
+//<2019/03/20,Yuchen-[4101] deal with recovery UI issue
+static inline int mdss_spi_panel_kickoff_recovery(struct mdss_panel_data *pdata,
+				char *buf, int len, int stride, bool bDelay){
+	return 0;
+}
+//>2019/03/20,Yuchen
 static inline int is_spi_panel_continuous_splash_on(
 				struct mdss_panel_data *pdata)
 {

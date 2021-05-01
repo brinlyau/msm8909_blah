@@ -250,6 +250,18 @@ config SENSORS_AKM8963
 	  To compile this driver as a module, choose M here: the
 	  module will be called akm8963.
 
+config SENSORS_GMC306
+	tristate "GMC306 3-axis electronic compass sensor driver"
+	depends on I2C
+	default n
+	help
+	  Say Y here if you want to enable the gmc306 ecompass sensor
+	  driver.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called gmc306.
+
+
 config INPUT_APANEL
 	tristate "Fujitsu Lifebook Application Panel buttons"
 	depends on X86 && I2C && LEDS_CLASS
@@ -798,6 +810,17 @@ config SENSORS_LTR553
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called ltr553.
+
+config SENSORS_STK3X1X
+	tristate "STK3X1X light and proximity device driver"
+	bool "SensorTek stk3x1x"
+	depends on I2C
+	help
+	  Say Y here if you want to enable the STK3X1X light and
+	  proximity sensor driver.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called stk3x1x
 
 config SENSORS_MMC3416X
 	tristate "MMC3416xPJ 3-axis magnetic sensor driver"

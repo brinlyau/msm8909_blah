@@ -926,15 +926,26 @@ static struct attribute_group mdss_fb_attr_group = {
 	.attrs = mdss_fb_attrs,
 };
 
+//[4101][Raymond] EPD dynamic change waveform and partial update -begin
+extern const struct attribute_group epd_attr_group;
+//[4101][Raymond] EPD dynamic change waveform and partial update -end
+//[4101][Raymond] EPD dynamic change waveform and partial update -begin
 static int mdss_fb_create_sysfs(struct msm_fb_data_type *mfd)
 {
 	int rc;
-
+	pr_err("%s ++\n",__func__);
 	rc = sysfs_create_group(&mfd->fbi->dev->kobj, &mdss_fb_attr_group);
 	if (rc)
-		pr_err("sysfs group creation failed, rc=%d\n", rc);
+		pr_err("sysfs mdss_fb_attr_group group creation failed, rc=%d\n", rc);
+
+	rc = sysfs_create_group(&mfd->fbi->dev->kobj, &epd_attr_group);
+	if (rc)
+		pr_err("sysfs epd_attr_group group creation failed, rc=%d\n", rc);
+
+	pr_err("%s --\n",__func__);	
 	return rc;
 }
+//[4101][Raymond] EPD dynamic change waveform and partial update -end
 
 static void mdss_fb_remove_sysfs(struct msm_fb_data_type *mfd)
 {
@@ -3337,7 +3348,7 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 {
 	struct msm_fb_data_type *mfd = (struct msm_fb_data_type *)info->par;
 	struct mdp_layer_commit_v1 *commit_v1;
-	struct mdp_output_layer *output_layer;
+	struct mdp_output_layer output_layer;
 	struct mdss_panel_info *pinfo;
 	bool wait_for_finish, wb_change = false;
 	int ret = -EPERM;
@@ -3369,36 +3380,41 @@ int mdss_fb_atomic_commit(struct fb_info *info,
 
 	commit_v1 = &commit->commit_v1;
 	if (commit_v1->flags & MDP_VALIDATE_LAYER) {
-		if (!mfd->skip_koff_wait) {
 			ret = mdss_fb_wait_for_kickoff(mfd);
 			if (ret) {
 				pr_err("wait for kickoff failed\n");
-				goto end;
-			}
-		}
+		} else {
 		__ioctl_transition_dyn_mode_state(mfd,
 			MSMFB_ATOMIC_COMMIT, true, false);
 		if (mfd->panel.type == WRITEBACK_PANEL) {
-			output_layer = commit_v1->output_layer;
-			if (!output_layer) {
+				if (!commit_v1->output_layer) {
 				pr_err("Output layer is null\n");
 				goto end;
 			}
+				ret = copy_from_user(&output_layer,
+				commit_v1->output_layer, sizeof(output_layer));
+				if (ret) {
+					pr_err("output_layer copy from user failed\n");
+					goto end;
+				}
+
+
 			wb_change = !mdss_fb_is_wb_config_same(mfd,
-					commit_v1->output_layer);
+						&output_layer);
 			if (wb_change) {
 				old_xres = pinfo->xres;
 				old_yres = pinfo->yres;
 				old_format = mfd->fb_imgType;
 				mdss_fb_update_resolution(mfd,
-					output_layer->buffer.width,
-					output_layer->buffer.height,
-					output_layer->buffer.format);
+						output_layer.buffer.width,
+						output_layer.buffer.height,
+						output_layer.buffer.format);
 			}
 		}
 		ret = mfd->mdp.atomic_validate(mfd, file, commit_v1);
 		if (!ret)
 			mfd->atomic_commit_pending = true;
+		}
 		goto end;
 	} else {
 		ret = mdss_fb_pan_idle(mfd);
